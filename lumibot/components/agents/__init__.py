@@ -19,6 +19,7 @@ _SUBMODULES = {
     "docs_tools",
     "duckdb_tools",
     "manager",
+    "options_tools",
     "replay_cache",
     "runtime",
     "schemas",

@@ -1,0 +1,42 @@
+version: "3.9"
+
+services:
+  lumibot-options:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: lumibot-options:latest
+    container_name: lumibot-options-trader
+    restart: unless-stopped
+
+    env_file:
+      - .env
+
+    environment:
+      # Make sure these are set in .env or passed explicitly
+      - LUMIBOT_MEMORY_DIR=/data/memory
+      - TRADIER_PAPER=true
+
+    volumes:
+      # Persistent memory (agent decisions, theses, audit trail)
+      - lumibot_memory:/data/memory
+      # Logs accessible from host
+      - lumibot_logs:/data/logs
+      # Mount the strategy file so changes are picked up on restart
+      - ./example_strategies/ai_trading_team_options_debate.py:/app/example_strategies/ai_trading_team_options_debate.py:ro
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+    # No ports exposed — all interaction is via Telegram
+
+volumes:
+  lumibot_memory:
+    name: lumibot_memory
+  lumibot_logs:
+    name: lumibot_logs
