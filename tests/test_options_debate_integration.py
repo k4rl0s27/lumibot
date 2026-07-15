@@ -310,6 +310,13 @@ class TestTradingIterationFlow:
         strategy.telegram_bot.wait_for_approval = MagicMock(return_value=False)
         strategy.telegram_bot.start = MagicMock()
 
+        # Mock order tracking (needed by the approval gate in on_trading_iteration)
+        strategy.get_orders = MagicMock(return_value=[])
+        strategy.cancel_orders = MagicMock()
+
+        # Ensure SKIP_HUMAN_APPROVAL is not set (tests that need it override via patch.dict)
+        os.environ.pop("SKIP_HUMAN_APPROVAL", None)
+
         return strategy
 
     def test_pass_decision_skips_telegram_approval(self, mock_telegram_bot):
@@ -350,11 +357,12 @@ class TestTradingIterationFlow:
         strategy.memory.remember_decision.assert_called_once()
 
     def test_trade_decision_triggers_approval_gate(self, mock_telegram_bot):
-        """When PM decides TRADE, should trigger send_approval_request and wait_for_approval."""
+        """When PM submits orders, should trigger approval gate regardless of decision text."""
         strategy = self._make_strategy_with_mocked_agents(mock_telegram_bot)
 
+        # PM can call it PIVOT, ADAPT, anything — gate is on orders, not text
         trade_decision = (
-            "FINAL DECISION: TRADE\n\n"
+            "FINAL DECISION: PIVOT\n\n"
             "- Strategy: Bull Put Spread\n"
             "- Underlying: SPY\n"
             "- Legs: sell_to_open SPY 445P 2026-08-21 qty 2, buy_to_open SPY 440P 2026-08-21 qty 2\n"
@@ -378,14 +386,20 @@ class TestTradingIterationFlow:
         strategy.agents["bear_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
         strategy.agents["risk_manager"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
 
-        strategy.on_trading_iteration()
+        # Simulate PM having submitted orders: pre-PM returns empty, post-PM returns 1 order
+        mock_order = MagicMock()
+        mock_order.identifier = "order-pivot-001"
+        strategy.get_orders = MagicMock(side_effect=[[], [mock_order]])
 
-        # Should call approval flow
+        with patch.dict(os.environ, {"SKIP_HUMAN_APPROVAL": "false"}):
+            strategy.on_trading_iteration()
+
+        # Should call approval flow — gate triggers on orders submitted, not "TRADE" text
         strategy.telegram_bot.send_approval_request.assert_called_once_with(trade_decision)
         strategy.telegram_bot.wait_for_approval.assert_called_once()
 
     def test_trade_rejected_by_user(self, mock_telegram_bot):
-        """When user rejects, should log rejection, no orders."""
+        """When user rejects, should cancel orders and log rejection."""
         strategy = self._make_strategy_with_mocked_agents(mock_telegram_bot)
 
         trade_decision = "FINAL DECISION: TRADE\n\nBuy SPY calls."
@@ -398,19 +412,26 @@ class TestTradingIterationFlow:
         strategy.agents["bull_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
         strategy.agents["bear_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
         strategy.agents["risk_manager"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+
+        # Simulate PM submitted an order
+        mock_order = MagicMock()
+        mock_order.identifier = "order-reject-001"
+        strategy.get_orders = MagicMock(side_effect=[[], [mock_order]])
 
         # User rejects
         strategy.telegram_bot.wait_for_approval.return_value = False
 
         strategy.on_trading_iteration()
 
+        # Should cancel the submitted order
+        strategy.cancel_orders.assert_called_once()
         # Should record as rejected
         strategy.memory.remember_decision.assert_called()
         call_args = strategy.memory.remember_decision.call_args
         assert "REJECTED" in call_args[0][0]
 
     def test_trade_approved_by_user(self, mock_telegram_bot):
-        """When user approves, should log approval and proceed."""
+        """When user approves, should log approval and NOT cancel orders."""
         strategy = self._make_strategy_with_mocked_agents(mock_telegram_bot)
 
         trade_decision = "FINAL DECISION: TRADE\n\nBuy SPY calls."
@@ -424,15 +445,159 @@ class TestTradingIterationFlow:
         strategy.agents["bear_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
         strategy.agents["risk_manager"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
 
+        # Simulate PM submitted an order
+        mock_order = MagicMock()
+        mock_order.identifier = "order-approve-001"
+        strategy.get_orders = MagicMock(side_effect=[[], [mock_order]])
+
         # User approves
         strategy.telegram_bot.wait_for_approval.return_value = True
 
         strategy.on_trading_iteration()
 
+        # Should NOT cancel orders
+        strategy.cancel_orders.assert_not_called()
         # Should record as approved
         strategy.memory.remember_decision.assert_called()
         call_args = strategy.memory.remember_decision.call_args
         assert "APPROVED" in call_args[0][0]
+
+    def test_rejected_trade_cancels_pm_orders(self, mock_telegram_bot):
+        """When user rejects, any orders PM submitted should be cancelled."""
+        strategy = self._make_strategy_with_mocked_agents(mock_telegram_bot)
+
+        trade_decision = "FINAL DECISION: TRADE\n\nBuy SPY 450C."
+        trade_result = SimpleNamespace(summary=trade_decision, text=trade_decision, cache_hit=True, warning_messages=[])
+
+        strategy.agents["portfolio_manager"].run = MagicMock(return_value=trade_result)
+        strategy.agents["macro_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["technical_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["options_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["bull_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["bear_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["risk_manager"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+
+        # Mock get_orders to simulate PM having submitted 2 orders
+        mock_order1 = MagicMock()
+        mock_order1.identifier = "order-001"
+        mock_order2 = MagicMock()
+        mock_order2.identifier = "order-002"
+        strategy.get_orders = MagicMock(
+            side_effect=[
+                # First call: pre-PM snapshot (empty)
+                [],
+                # Second call: post-PM snapshot (2 new orders)
+                [mock_order1, mock_order2],
+            ]
+        )
+        strategy.cancel_orders = MagicMock()
+
+        # User rejects
+        strategy.telegram_bot.wait_for_approval.return_value = False
+
+        strategy.on_trading_iteration()
+
+        # Should have called cancel_orders with the 2 new orders
+        strategy.cancel_orders.assert_called_once()
+        cancelled_orders = strategy.cancel_orders.call_args[0][0]
+        assert len(cancelled_orders) == 2
+        assert cancelled_orders[0].identifier == "order-001"
+        assert cancelled_orders[1].identifier == "order-002"
+
+    def test_approved_trade_does_not_cancel_orders(self, mock_telegram_bot):
+        """When user approves, PM-submitted orders should NOT be cancelled."""
+        strategy = self._make_strategy_with_mocked_agents(mock_telegram_bot)
+
+        trade_decision = "FINAL DECISION: TRADE\n\nSell SPY 445P."
+        trade_result = SimpleNamespace(summary=trade_decision, text=trade_decision, cache_hit=True, warning_messages=[])
+
+        strategy.agents["portfolio_manager"].run = MagicMock(return_value=trade_result)
+        strategy.agents["macro_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["technical_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["options_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["bull_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["bear_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["risk_manager"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+
+        # Mock get_orders to simulate PM having submitted orders
+        mock_order1 = MagicMock()
+        mock_order1.identifier = "order-001"
+        strategy.get_orders = MagicMock(
+            side_effect=[
+                [],                      # pre-PM snapshot
+                [mock_order1],           # post-PM snapshot
+            ]
+        )
+        strategy.cancel_orders = MagicMock()
+
+        # User approves
+        strategy.telegram_bot.wait_for_approval.return_value = True
+
+        strategy.on_trading_iteration()
+
+        # cancel_orders should NOT have been called
+        strategy.cancel_orders.assert_not_called()
+
+    def test_no_pm_orders_submitted_on_rejection_is_safe(self, mock_telegram_bot):
+        """If PM didn't submit any orders, rejection should be a no-op for cancellation."""
+        strategy = self._make_strategy_with_mocked_agents(mock_telegram_bot)
+
+        trade_decision = "FINAL DECISION: TRADE\n\nBuy SPY 450C."
+        trade_result = SimpleNamespace(summary=trade_decision, text=trade_decision, cache_hit=True, warning_messages=[])
+
+        strategy.agents["portfolio_manager"].run = MagicMock(return_value=trade_result)
+        strategy.agents["macro_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["technical_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["options_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["bull_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["bear_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["risk_manager"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+
+        # get_orders returns same orders before and after (PM didn't submit any)
+        strategy.get_orders = MagicMock(return_value=[])
+        strategy.cancel_orders = MagicMock()
+
+        strategy.telegram_bot.wait_for_approval.return_value = False
+
+        strategy.on_trading_iteration()
+
+        # cancel_orders should NOT be called since there were no new orders
+        strategy.cancel_orders.assert_not_called()
+
+    def test_skip_approval_auto_approves_orders(self, mock_telegram_bot):
+        """SKIP_HUMAN_APPROVAL=true should skip Telegram gate and auto-approve orders."""
+        import os
+        strategy = self._make_strategy_with_mocked_agents(mock_telegram_bot)
+
+        trade_decision = "FINAL DECISION: TRADE\n\nBuy SPY 450C."
+        trade_result = SimpleNamespace(summary=trade_decision, text=trade_decision, cache_hit=True, warning_messages=[])
+
+        strategy.agents["portfolio_manager"].run = MagicMock(return_value=trade_result)
+        strategy.agents["macro_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["technical_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["options_analyst"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["bull_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["bear_case"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+        strategy.agents["risk_manager"].run = MagicMock(return_value=SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[]))
+
+        # Simulate PM submitted an order
+        mock_order = MagicMock()
+        mock_order.identifier = "order-skip-001"
+        strategy.get_orders = MagicMock(side_effect=[[], [mock_order]])
+
+        # Enable skip approval
+        with patch.dict(os.environ, {"SKIP_HUMAN_APPROVAL": "true"}):
+            strategy.on_trading_iteration()
+
+        # Should NOT call Telegram approval
+        strategy.telegram_bot.send_approval_request.assert_not_called()
+        strategy.telegram_bot.wait_for_approval.assert_not_called()
+        # Should NOT cancel orders
+        strategy.cancel_orders.assert_not_called()
+        # Should record as auto-approved
+        strategy.memory.remember_decision.assert_called()
+        call_args = strategy.memory.remember_decision.call_args
+        assert "AUTO-APPROVED" in call_args[0][0]
 
     def test_all_agents_called_in_correct_order(self, mock_telegram_bot):
         """Agents should be called in the order: macro, technical, options, bull, bear, risk, PM."""

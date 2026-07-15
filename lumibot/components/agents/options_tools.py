@@ -505,6 +505,8 @@ def get_option_strategy_analysis(
     strikes: list[float],
     expiration: str,
     option_type: str = "call",
+    leg_types: list[str] | None = None,
+    leg_sides: list[str] | None = None,
 ) -> dict[str, Any]:
     """Analyze an options strategy's risk/reward profile.
 
@@ -514,7 +516,15 @@ def get_option_strategy_analysis(
             calendar_spread, butterfly, covered_call, cash_secured_put.
         strikes: List of strike prices for the strategy legs, in order.
         expiration: Expiration date in YYYY-MM-DD format.
-        option_type: "call" or "put" — used for single-leg-direction strategies.
+        option_type: "call" or "put" — default for all legs when leg_types is
+            not provided. Ignored if leg_types is supplied.
+        leg_types: Per-leg option type ("call" or "put"). Required for mixed
+            strategies like iron condors that combine calls and puts.
+            Length must match strikes.
+        leg_sides: Per-leg trade side ("buy" or "sell", or the full
+            "buy_to_open"/"sell_to_open" forms). Used to compute net debit/credit
+            correctly. Length must match strikes. If None, all legs are treated
+            as buys (debit).
 
     Returns:
         A dictionary with risk/reward analysis.
@@ -526,6 +536,26 @@ def get_option_strategy_analysis(
         if not strikes:
             return {"ok": False, "error": "At least one strike price is required."}
 
+        num_legs = len(strikes)
+
+        # Normalize leg_types: use per-leg list or fall back to option_type for all
+        if leg_types is None:
+            leg_types = [option_type] * num_legs
+        elif len(leg_types) != num_legs:
+            return {
+                "ok": False,
+                "error": f"leg_types length ({len(leg_types)}) must match strikes length ({num_legs}).",
+            }
+
+        # Normalize leg_sides: default to all buys if not provided
+        if leg_sides is None:
+            leg_sides = ["buy"] * num_legs
+        elif len(leg_sides) != num_legs:
+            return {
+                "ok": False,
+                "error": f"leg_sides length ({len(leg_sides)}) must match strikes length ({num_legs}).",
+            }
+
         # Get the underlying price
         stock_asset = Asset(symbol=symbol.upper(), asset_type=Asset.AssetType.STOCK)
         underlying_price = _safe_float(self.get_last_price(stock_asset))
@@ -536,11 +566,12 @@ def get_option_strategy_analysis(
                 "error": f"Could not get underlying price for {symbol}.",
             }
 
-        # Get option prices for each leg
+        # Get option prices for each leg, using the correct option type per leg
         leg_prices = []
         leg_greeks = []
-        for strike in strikes:
-            opt_asset = _build_options_asset(symbol, expiration, strike, option_type)
+        for i, strike in enumerate(strikes):
+            leg_opt_type = leg_types[i].lower()
+            opt_asset = _build_options_asset(symbol, expiration, strike, leg_opt_type)
             try:
                 price = _safe_float(self.get_last_price(opt_asset))
                 greeks = self.get_greeks(opt_asset, underlying_price=underlying_price)
@@ -557,6 +588,8 @@ def get_option_strategy_analysis(
             strikes=strikes,
             leg_prices=leg_prices,
             leg_greeks=leg_greeks,
+            leg_sides=leg_sides,
+            leg_types=leg_types,
             underlying_price=underlying_price,
             expiration=expiration,
         )
@@ -592,6 +625,8 @@ def _analyze_strategy_pl(
     strikes: list[float],
     leg_prices: list[float | None],
     leg_greeks: list[dict | None],
+    leg_sides: list[str],
+    leg_types: list[str],
     underlying_price: float,
     expiration: str,
 ) -> dict[str, Any]:
@@ -599,8 +634,31 @@ def _analyze_strategy_pl(
 
     This is a simplified analytical model. For production use, the full
     OptionsHelper should be used for precise multi-leg pricing.
+
+    Args:
+        strategy_type: The strategy type identifier.
+        strikes: Strike prices per leg (in order).
+        leg_prices: Absolute (positive) option mid/last prices per leg.
+        leg_greeks: Greeks dicts per leg.
+        leg_sides: "buy" or "sell" per leg — used to sign net_cost.
+        leg_types: "call" or "put" per leg.
+        underlying_price: Current underlying price.
+        expiration: Expiration date string.
     """
-    known_prices = [p for p in leg_prices if p is not None]
+    multiplier = 100.0
+
+    # Compute signed net cost: sell legs contribute +credit, buy legs contribute -debit
+    signed_prices: list[float] = []
+    for price, side in zip(leg_prices, leg_sides):
+        if price is None:
+            continue
+        side_lower = side.lower().strip()
+        if "sell" in side_lower:
+            signed_prices.append(price)   # credit received
+        else:
+            signed_prices.append(-price)  # debit paid
+
+    known_prices = [abs(p) for p in signed_prices]
 
     if not known_prices:
         return {
@@ -612,58 +670,71 @@ def _analyze_strategy_pl(
             "warning": "Could not determine option prices. Market may be closed or strikes are illiquid.",
         }
 
-    # Net debit/credit
-    net_cost = sum(p for p in leg_prices if p is not None)
+    # net_cost > 0 = net credit, net_cost < 0 = net debit
+    net_cost = sum(signed_prices)
 
     if strategy_type in ("vertical_spread", "call_spread", "put_spread"):
         if len(strikes) < 2:
             return {"ok": False, "error": "Vertical spread requires exactly 2 strikes."}
         width = abs(strikes[0] - strikes[1])
-        multiplier = 100.0  # standard contract multiplier
-        if net_cost < 0:
-            # Credit spread
-            max_profit = abs(net_cost) * multiplier
+        if net_cost > 0:
+            # Net credit spread
+            max_profit = net_cost * multiplier
             max_loss = (width * multiplier) - max_profit
         else:
-            # Debit spread
-            max_loss = net_cost * multiplier
+            # Net debit spread
+            max_loss = abs(net_cost) * multiplier
             max_profit = (width * multiplier) - max_loss
-        breakeven = strikes[0] + (net_cost if net_cost > 0 else -net_cost)
+        # Breakeven: for calls, short strike + net credit (or long strike + net debit);
+        # for puts, short strike - net credit (or long strike - net debit).
+        # We use a general formula: the breakeven is the short strike adjusted by the
+        # net credit/debit. For debit spreads the short leg is the higher strike (calls)
+        # or lower strike (puts). For credit spreads, it's the opposite.
+        short_strike = strikes[0] if leg_sides[0].lower().startswith("sell") else strikes[1]
+        if net_cost > 0:
+            breakeven = short_strike - net_cost if "put" in leg_types[0].lower() else short_strike + net_cost
+        else:
+            breakeven = short_strike - net_cost if "put" in leg_types[0].lower() else short_strike + net_cost
         breakevens = [round(breakeven, 2)]
 
     elif strategy_type in ("straddle",):
         if len(strikes) < 1:
             return {"ok": False, "error": "Straddle requires 1 strike."}
-        # Long straddle
-        total_cost = abs(net_cost) * 100.0
+        # Long straddle: both legs bought
+        total_cost = abs(net_cost) * multiplier
         max_profit = None  # unlimited
         max_loss = total_cost
         breakevens = [
-            round(strikes[0] + net_cost, 2),
-            round(strikes[0] - net_cost, 2),
+            round(strikes[0] + abs(net_cost), 2),
+            round(strikes[0] - abs(net_cost), 2),
         ]
 
     elif strategy_type in ("strangle",):
         if len(strikes) < 2:
             return {"ok": False, "error": "Strangle requires 2 strikes."}
-        total_cost = abs(net_cost) * 100.0
+        total_cost = abs(net_cost) * multiplier
         max_profit = None  # unlimited
         max_loss = total_cost
         breakevens = [
-            round(max(strikes) + net_cost, 2),
-            round(min(strikes) - net_cost, 2),
+            round(max(strikes) + abs(net_cost), 2),
+            round(min(strikes) - abs(net_cost), 2),
         ]
 
     elif strategy_type in ("iron_condor",):
         if len(strikes) < 4:
             return {"ok": False, "error": "Iron condor requires 4 strikes."}
         sorted_strikes = sorted(strikes)
-        wing_width = sorted_strikes[1] - sorted_strikes[0]
-        max_profit = abs(net_cost) * 100.0
-        max_loss = (wing_width * 100.0) - max_profit
+        # Iron condor: short put at K2, long put at K1 (lower wing),
+        # short call at K3, long call at K4 (upper wing).
+        # Max loss = max(put_wing_width, call_wing_width) * 100 - net_credit
+        put_wing_width = sorted_strikes[1] - sorted_strikes[0]
+        call_wing_width = sorted_strikes[3] - sorted_strikes[2]
+        max_wing_width = max(put_wing_width, call_wing_width)
+        max_profit = abs(net_cost) * multiplier  # net credit received
+        max_loss = (max_wing_width * multiplier) - max_profit
         breakevens = [
-            round(sorted_strikes[0] - net_cost, 2),
-            round(sorted_strikes[3] + net_cost, 2),
+            round(sorted_strikes[1] - abs(net_cost), 2),   # lower BE: short put - credit
+            round(sorted_strikes[2] + abs(net_cost), 2),   # upper BE: short call + credit
         ]
 
     elif strategy_type in ("butterfly",):
@@ -671,8 +742,8 @@ def _analyze_strategy_pl(
             return {"ok": False, "error": "Butterfly requires 3 strikes."}
         sorted_strikes = sorted(strikes)
         wing_width = sorted_strikes[2] - sorted_strikes[1]
-        max_profit = (wing_width * 100.0) - abs(net_cost) * 100.0
-        max_loss = abs(net_cost) * 100.0
+        max_profit = (wing_width * multiplier) - abs(net_cost) * multiplier
+        max_loss = abs(net_cost) * multiplier
         breakevens = [
             round(sorted_strikes[0] + abs(net_cost), 2),
             round(sorted_strikes[2] - abs(net_cost), 2),
@@ -681,20 +752,20 @@ def _analyze_strategy_pl(
     elif strategy_type in ("covered_call",):
         if len(strikes) < 1:
             return {"ok": False, "error": "Covered call requires 1 strike."}
-        # Assume 100 shares purchased at underlying
-        stock_cost = underlying_price * 100.0
-        premium = abs(sum(p for p in leg_prices if p is not None)) * 100.0
-        max_profit = (strikes[0] - underlying_price) * 100.0 + premium
+        # Assume 100 shares purchased at underlying, call sold against them
+        stock_cost = underlying_price * multiplier
+        premium = abs(net_cost) * multiplier  # net_cost for a sold call is positive
+        max_profit = (strikes[0] - underlying_price) * multiplier + premium
         max_loss = stock_cost - premium
-        breakevens = [round(underlying_price - net_cost, 2)]
+        breakevens = [round(underlying_price - abs(net_cost), 2)]
 
     elif strategy_type in ("cash_secured_put",):
         if len(strikes) < 1:
             return {"ok": False, "error": "Cash-secured put requires 1 strike."}
-        premium = abs(sum(p for p in leg_prices if p is not None)) * 100.0
+        premium = abs(net_cost) * multiplier  # net_cost for a sold put is positive
         max_profit = premium
-        max_loss = (strikes[0] * 100.0) - premium
-        breakevens = [round(strikes[0] - net_cost, 2)]
+        max_loss = (strikes[0] * multiplier) - premium
+        breakevens = [round(strikes[0] - abs(net_cost), 2)]
 
     else:
         return {
@@ -839,7 +910,6 @@ def get_options_market_snapshot(
 
         # Estimate historical volatility (20-day)
         try:
-            import pandas as pd
             bars = self.get_historical_prices(stock_asset, length=21, timestep="day")
             if bars is not None and hasattr(bars, "df"):
                 df = bars.df

@@ -30,6 +30,7 @@ import logging
 import os
 from datetime import datetime, timedelta
 
+from lumibot.entities import Order
 from lumibot.strategies.strategy import Strategy
 
 logger = logging.getLogger(__name__)
@@ -182,6 +183,16 @@ RULES:
 - Only trade symbols from the provided universe.
 - If trading, you MUST be specific about exact strikes, expirations, and quantities. Generic statements are not actionable.
 
+ACCOUNT RESTRICTION (Level 1): Your account is approved for Level 1 options
+trading only. You may ONLY use these two strategies:
+  - Covered Call (buy stock + sell call against it)
+  - Cash-Secured Put (sell put, fully cash-backed)
+Do NOT propose spreads, straddles, strangles, iron condors, butterflies,
+or any multi-leg option strategy. Do NOT sell naked calls or buy options
+without the corresponding stock or cash position. If the best trade idea
+requires a higher level, state "PASS — requires Level 3+" and recommend
+buying/selling the underlying stock as a simpler alternative.
+
 You have access to the built-in order tools (submit_order, etc.). Use them only after human approval is received — the strategy will handle the approval gate."""
 
 
@@ -233,6 +244,23 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
         research_model = os.environ.get("AI_TRADING_TEAM_MODEL", "deepseek/deepseek-chat")
         decision_model = os.environ.get("PORTFOLIO_MANAGER_MODEL", "deepseek/deepseek-reasoner")
 
+        # ---- Options Agent Tools ----
+        # These @agent_tool functions give agents access to live options chains,
+        # Greeks, IV/HV analysis, strategy P/L, and portfolio risk metrics.
+        from lumibot.components.agents.options_tools import (
+            get_option_chain_summary,
+            get_option_strategy_analysis,
+            get_options_market_snapshot,
+            get_portfolio_greeks_summary,
+        )
+
+        _options_tools = [
+            get_option_chain_summary,
+            get_option_strategy_analysis,
+            get_options_market_snapshot,
+            get_portfolio_greeks_summary,
+        ]
+
         # ---- Create Agents (1-6: read-only, 7: trading) ----
 
         # 1. Macro Analyst
@@ -241,6 +269,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             model=research_model,
             allow_trading=False,
             system_prompt=MACRO_ANALYST_PROMPT,
+            tools=_options_tools,
         )
 
         # 2. Technical Analyst
@@ -249,6 +278,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             model=research_model,
             allow_trading=False,
             system_prompt=TECHNICAL_ANALYST_PROMPT,
+            tools=_options_tools,
         )
 
         # 3. Options Analyst
@@ -257,6 +287,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             model=research_model,
             allow_trading=False,
             system_prompt=OPTIONS_ANALYST_PROMPT,
+            tools=_options_tools,
         )
 
         # 4. Bull Case
@@ -265,6 +296,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             model=research_model,
             allow_trading=False,
             system_prompt=BULL_CASE_PROMPT,
+            tools=_options_tools,
         )
 
         # 5. Bear Case
@@ -273,6 +305,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             model=research_model,
             allow_trading=False,
             system_prompt=BEAR_CASE_PROMPT,
+            tools=_options_tools,
         )
 
         # 6. Risk Manager
@@ -281,6 +314,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             model=research_model,
             allow_trading=False,
             system_prompt=RISK_MANAGER_PROMPT,
+            tools=_options_tools,
         )
 
         # 7. Portfolio Manager (trade-enabled)
@@ -289,6 +323,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             model=decision_model,
             allow_trading=True,
             system_prompt=PORTFOLIO_MANAGER_PROMPT,
+            tools=_options_tools,
         )
 
         self.log_message("Options Debate Strategy initialized with 7 agents.", color="green")
@@ -443,8 +478,16 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
         self.log_message(f"  ← Risk Manager done (recommendation: APPROVE/REDUCE/REJECT).", color="blue")
 
         # ---- Phase 4: DECISION (agent 7) ----
+        # Snapshot open orders BEFORE the PM agent runs, so we can identify
+        # which orders it submitted (if any) for potential cancellation.
 
         self.log_message("[4/5] Portfolio Manager making final decision...", color="blue")
+        pre_pm_order_ids = {
+            o.identifier
+            for o in self.get_orders(statuses=Order.ACTIVE_STATUSES)
+            if getattr(o, "identifier", None)
+        }
+
         pm_result = self.agents["portfolio_manager"].run(
             task_prompt=(
                 f"Synthesize ALL research, debate, and risk analysis into a final "
@@ -465,33 +508,67 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
         decision_text = pm_result.summary or pm_result.text
         self.log_message(f"  ← Portfolio Manager decision:\n{decision_text}", color="green")
 
+        # Identify orders the PM agent submitted during its run
+        pm_submitted_orders = [
+            o
+            for o in self.get_orders(statuses=Order.ACTIVE_STATUSES)
+            if getattr(o, "identifier", None) and o.identifier not in pre_pm_order_ids
+        ]
+        if pm_submitted_orders:
+            self.log_message(
+                f"  PM agent submitted {len(pm_submitted_orders)} order(s): "
+                f"{[o.identifier for o in pm_submitted_orders]}",
+                color="blue",
+            )
+
         # ---- Phase 5: HUMAN APPROVAL GATE ----
+        # Gate on ORDERS SUBMITTED, not on decision text.
+        # The PM may call its decision TRADE, PIVOT, ADAPT, or anything else —
+        # if it submitted real orders, the human MUST approve or reject them.
+        # If no orders were submitted, it's a true PASS with nothing to gate.
 
-        self.log_message("[5/5] Sending to Telegram for human approval...", color="yellow")
-
-        # Determine if this is a TRADE or PASS
-        is_trade = "FINAL DECISION: TRADE" in decision_text.upper()
-
-        if not is_trade:
-            # PASS — notify and log, no action needed
-            self.log_message("Decision: PASS. No trade today.", color="yellow")
+        if not pm_submitted_orders:
+            # True PASS — PM didn't submit any orders. Nothing to approve.
+            self.log_message("[5/5] Decision: PASS. No orders submitted.", color="yellow")
             self.notify(
                 title="Options Debate — PASS",
                 message=f"No trade today.\n\n{decision_text[:500]}",
                 severity="info",
             )
-            # Store in memory for audit
             self.memory.remember_decision(
                 f"PASS: {decision_text[:300]}",
                 symbol=",".join(universe),
                 action="hold",
             )
+            self.log_message(f"=== Options Debate Cycle Complete: {today} ===", color="yellow")
             return
 
-        # TRADE — send for approval
+        # Orders were submitted — check if we need human approval
+        skip_approval = os.environ.get("SKIP_HUMAN_APPROVAL", "false").lower() in ("true", "1", "yes")
+
+        if skip_approval:
+            # Auto-approve: orders go straight to broker, no human gate.
+            self.log_message(
+                f"[5/5] SKIP_HUMAN_APPROVAL=true — {len(pm_submitted_orders)} order(s) "
+                f"auto-approved. Verify in Tradier dashboard.",
+                color="green",
+            )
+            self.memory.remember_decision(
+                f"AUTO-APPROVED: {decision_text[:300]}",
+                symbol=",".join(universe),
+                action="buy",
+            )
+            self.log_message(f"=== Options Debate Cycle Complete: {today} ===", color="yellow")
+            return
+
+        # Human approval required
+        self.log_message(
+            f"[5/5] {len(pm_submitted_orders)} order(s) submitted — sending to Telegram for approval...",
+            color="yellow",
+        )
+
         self.telegram_bot.send_approval_request(decision_text)
 
-        # Notify user
         self.notify(
             title="⚡ Options Trade — Approval Required",
             message=f"A trade decision is waiting for your approval.\n\n"
@@ -505,7 +582,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
         approved = self.telegram_bot.wait_for_approval(timeout_minutes=timeout)
 
         if approved:
-            self.log_message("✅ Trade APPROVED by user. Executing...", color="green")
+            self.log_message("✅ Trade APPROVED by user. Orders stay at broker.", color="green")
             self.notify(
                 title="✅ Trade Approved",
                 message=f"Executing the approved trade now.\n\n{decision_text[:500]}",
@@ -516,18 +593,27 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
                 symbol=",".join(universe),
                 action="buy",
             )
-            # The portfolio_manager agent has allow_trading=True, so it already
-            # submitted orders via its built-in tools during its run.
-            # If we need to re-submit or verify, we'd do it here.
-            # For safety, we verify the orders are in the broker.
-            self.log_message("Trade submitted. Verify in Tradier dashboard.", color="green")
-
         else:
-            self.log_message("❌ Trade REJECTED or timed out. No orders placed.", color="red")
+            # Cancel any orders the PM agent submitted before approval was denied
+            self.log_message(
+                f"Cancelling {len(pm_submitted_orders)} order(s) submitted before approval...",
+                color="yellow",
+            )
+            try:
+                self.cancel_orders(pm_submitted_orders)
+                self.log_message("Orders cancelled successfully.", color="green")
+            except Exception as cancel_err:
+                self.log_message(
+                    f"WARNING: Failed to cancel some orders: {cancel_err}. "
+                    f"Please manually cancel in Tradier dashboard.",
+                    color="red",
+                )
+
+            self.log_message("❌ Trade REJECTED or timed out. Orders cancelled.", color="red")
             self.notify(
                 title="❌ Trade Rejected",
                 message=f"The trade was rejected (or approval timed out). "
-                f"No orders have been placed.\n\n{decision_text[:300]}",
+                f"Orders have been cancelled.\n\n{decision_text[:300]}",
                 severity="warning",
             )
             self.memory.remember_decision(

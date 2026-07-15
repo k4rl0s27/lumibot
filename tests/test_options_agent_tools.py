@@ -314,13 +314,91 @@ class TestGetPortfolioGreeksSummary:
 class TestGetOptionStrategyAnalysis:
     """Tests for the get_option_strategy_analysis agent tool."""
 
-    def test_vertical_spread_analysis(self):
-        """Should calculate correct P/L for a vertical spread."""
+    def test_vertical_spread_credit_with_buy_sell_sides(self):
+        """Should calculate correct P/L for a credit spread with leg_sides."""
         from lumibot.components.agents.options_tools import get_option_strategy_analysis
 
         strategy = _OptionsToolsStrategy()
-        # Call at 450, Put at 445 → 5-wide put spread
-        strategy._last_price = 3.0  # premium received
+        strategy._last_price = 450.0  # underlying price
+        strategy._greeks = _make_mock_greeks()
+
+        # Sell 450P @ $3.00, Buy 445P @ $1.00 → $2.00 net credit, 5-wide
+        _leg_prices = {"SPY_2026-07-17_450.0_PUT": 3.0, "SPY_2026-07-17_445.0_PUT": 1.0}
+        _original_get_last_price = strategy.get_last_price
+
+        def _priced_get_last_price(asset, quote=None, exchange=None):
+            # Determine if this is an option leg
+            atype = str(getattr(asset, "asset_type", ""))
+            if "option" in atype.lower():
+                key = f"{asset.symbol}_{asset.expiration}_{asset.strike}_{asset.right}"
+                return _leg_prices.get(key, 1.0)
+            # Stock/underlying — use the default
+            return 450.0
+
+        strategy.get_last_price = _priced_get_last_price
+
+        result = get_option_strategy_analysis(
+            strategy,
+            symbol="SPY",
+            strategy_type="vertical_spread",
+            strikes=[450.0, 445.0],
+            expiration="2026-07-17",
+            option_type="put",
+            leg_sides=["sell", "buy"],
+        )
+
+        assert result["ok"] is True
+        assert result["strategy_type"] == "vertical_spread"
+        # Net credit = +3.00 - 1.00 = $2.00 per share
+        assert result["net_debit_credit"] == pytest.approx(2.0, rel=0.01)
+        # Max profit = $200, Max loss = $500 - $200 = $300
+        assert result["max_profit"] == pytest.approx(200.0, rel=0.01)
+        assert result["max_loss"] == pytest.approx(300.0, rel=0.01)
+        assert len(result["breakevens"]) == 1
+
+    def test_vertical_spread_debit_with_buy_sell_sides(self):
+        """Should calculate correct P/L for a debit spread with leg_sides."""
+        from lumibot.components.agents.options_tools import get_option_strategy_analysis
+
+        strategy = _OptionsToolsStrategy()
+        strategy._last_price = 450.0  # underlying price
+        strategy._greeks = _make_mock_greeks()
+
+        # Buy 450C @ $4.00, Sell 455C @ $1.50 → $2.50 net debit, 5-wide
+        _leg_prices = {"SPY_2026-07-17_450.0_CALL": 4.0, "SPY_2026-07-17_455.0_CALL": 1.5}
+
+        def _priced_get_last_price(asset, quote=None, exchange=None):
+            atype = str(getattr(asset, "asset_type", ""))
+            if "option" in atype.lower():
+                key = f"{asset.symbol}_{asset.expiration}_{asset.strike}_{asset.right}"
+                return _leg_prices.get(key, 1.0)
+            return 450.0
+
+        strategy.get_last_price = _priced_get_last_price
+
+        result = get_option_strategy_analysis(
+            strategy,
+            symbol="SPY",
+            strategy_type="vertical_spread",
+            strikes=[450.0, 455.0],
+            expiration="2026-07-17",
+            option_type="call",
+            leg_sides=["buy", "sell"],
+        )
+
+        assert result["ok"] is True
+        # Net debit = -4.00 + 1.50 = -$2.50 per share
+        assert result["net_debit_credit"] == pytest.approx(-2.5, rel=0.01)
+        # Max loss = $250, Max profit = $500 - $250 = $250
+        assert result["max_loss"] == pytest.approx(250.0, rel=0.01)
+        assert result["max_profit"] == pytest.approx(250.0, rel=0.01)
+
+    def test_vertical_spread_legacy_no_sides(self):
+        """Should still work without leg_sides (backward compat — all buys)."""
+        from lumibot.components.agents.options_tools import get_option_strategy_analysis
+
+        strategy = _OptionsToolsStrategy()
+        strategy._last_price = 3.0
         strategy._greeks = _make_mock_greeks()
 
         result = get_option_strategy_analysis(
@@ -333,9 +411,8 @@ class TestGetOptionStrategyAnalysis:
         )
 
         assert result["ok"] is True
-        assert result["strategy_type"] == "vertical_spread"
-        # Credit of $3.00 per share, 5-wide = max loss $200, max profit $300
-        assert result["max_profit"] is not None
+        # Without leg_sides, both legs are treated as buys (debit)
+        assert result["net_debit_credit"] < 0  # net debit
         assert result["max_loss"] is not None
         assert len(result["breakevens"]) == 1
 
@@ -361,13 +438,32 @@ class TestGetOptionStrategyAnalysis:
         assert result["max_loss"] is not None
         assert len(result["breakevens"]) == 2
 
-    def test_iron_condor_analysis(self):
-        """Should calculate correct P/L for an iron condor."""
+    def test_iron_condor_with_mixed_call_put_legs(self):
+        """Should calculate correct P/L for an iron condor with mixed call/put legs."""
         from lumibot.components.agents.options_tools import get_option_strategy_analysis
 
         strategy = _OptionsToolsStrategy()
-        strategy._last_price = 2.0  # net credit
+        strategy._last_price = 450.0
         strategy._greeks = _make_mock_greeks()
+
+        # Iron condor: Buy 430P @ $0.50, Sell 435P @ $1.00,
+        #              Sell 465C @ $1.00, Buy 470C @ $0.50
+        # Net credit = -0.50 + 1.00 + 1.00 - 0.50 = $1.00
+        _leg_prices = {
+            "SPY_2026-07-17_430.0_PUT": 0.5,
+            "SPY_2026-07-17_435.0_PUT": 1.0,
+            "SPY_2026-07-17_465.0_CALL": 1.0,
+            "SPY_2026-07-17_470.0_CALL": 0.5,
+        }
+
+        def _priced_get_last_price(asset, quote=None, exchange=None):
+            atype = str(getattr(asset, "asset_type", ""))
+            if "option" in atype.lower():
+                key = f"{asset.symbol}_{asset.expiration}_{asset.strike}_{asset.right}"
+                return _leg_prices.get(key, 1.0)
+            return 450.0
+
+        strategy.get_last_price = _priced_get_last_price
 
         result = get_option_strategy_analysis(
             strategy,
@@ -375,13 +471,98 @@ class TestGetOptionStrategyAnalysis:
             strategy_type="iron_condor",
             strikes=[430.0, 435.0, 465.0, 470.0],
             expiration="2026-07-17",
-            option_type="call",
+            leg_types=["put", "put", "call", "call"],
+            leg_sides=["buy", "sell", "sell", "buy"],
         )
 
         assert result["ok"] is True
-        assert result["max_profit"] is not None
-        assert result["max_loss"] is not None
+        assert result["strategy_type"] == "iron_condor"
+        # Net credit = $1.00 per share
+        assert result["net_debit_credit"] == pytest.approx(1.0, rel=0.01)
+        # Max profit = $100
+        assert result["max_profit"] == pytest.approx(100.0, rel=0.01)
+        # Max loss = 5*100 - 100 = $400
+        assert result["max_loss"] == pytest.approx(400.0, rel=0.01)
         assert len(result["breakevens"]) == 2
+
+    def test_iron_condor_unequal_wing_widths(self):
+        """Iron condor max loss should use the wider wing width."""
+        from lumibot.components.agents.options_tools import get_option_strategy_analysis
+
+        strategy = _OptionsToolsStrategy()
+        strategy._last_price = 450.0
+        strategy._greeks = _make_mock_greeks()
+
+        # Put wing = 5 (430→435), Call wing = 10 (460→470)
+        # Net credit = $2.00
+        _leg_prices = {
+            "SPY_2026-07-17_430.0_PUT": 0.5,
+            "SPY_2026-07-17_435.0_PUT": 1.5,
+            "SPY_2026-07-17_460.0_CALL": 1.5,
+            "SPY_2026-07-17_470.0_CALL": 0.5,
+        }
+
+        def _priced_get_last_price(asset, quote=None, exchange=None):
+            atype = str(getattr(asset, "asset_type", ""))
+            if "option" in atype.lower():
+                key = f"{asset.symbol}_{asset.expiration}_{asset.strike}_{asset.right}"
+                return _leg_prices.get(key, 1.0)
+            return 450.0
+
+        strategy.get_last_price = _priced_get_last_price
+
+        result = get_option_strategy_analysis(
+            strategy,
+            symbol="SPY",
+            strategy_type="iron_condor",
+            strikes=[430.0, 435.0, 460.0, 470.0],
+            expiration="2026-07-17",
+            leg_types=["put", "put", "call", "call"],
+            leg_sides=["buy", "sell", "sell", "buy"],
+        )
+
+        assert result["ok"] is True
+        # Max loss should use the wider wing (10), not the narrower (5)
+        # Net credit = $2.00, max profit = $200
+        # Max loss = 10*100 - 200 = $800
+        assert result["max_loss"] == pytest.approx(800.0, rel=0.01)
+        assert result["max_profit"] == pytest.approx(200.0, rel=0.01)
+
+    def test_rejects_mismatched_leg_types_length(self):
+        """Should return error when leg_types length doesn't match strikes."""
+        from lumibot.components.agents.options_tools import get_option_strategy_analysis
+
+        strategy = _OptionsToolsStrategy()
+
+        result = get_option_strategy_analysis(
+            strategy,
+            symbol="SPY",
+            strategy_type="iron_condor",
+            strikes=[430.0, 435.0, 465.0, 470.0],
+            expiration="2026-07-17",
+            leg_types=["put", "call"],  # Only 2 types for 4 strikes
+        )
+
+        assert result["ok"] is False
+        assert "leg_types" in result.get("error", "").lower()
+
+    def test_rejects_mismatched_leg_sides_length(self):
+        """Should return error when leg_sides length doesn't match strikes."""
+        from lumibot.components.agents.options_tools import get_option_strategy_analysis
+
+        strategy = _OptionsToolsStrategy()
+
+        result = get_option_strategy_analysis(
+            strategy,
+            symbol="SPY",
+            strategy_type="vertical_spread",
+            strikes=[450.0, 445.0],
+            expiration="2026-07-17",
+            leg_sides=["sell"],  # Only 1 side for 2 strikes
+        )
+
+        assert result["ok"] is False
+        assert "leg_sides" in result.get("error", "").lower()
 
     def test_returns_error_for_unknown_strategy(self):
         """Should return ok=False for unknown strategy types."""
@@ -400,13 +581,25 @@ class TestGetOptionStrategyAnalysis:
         assert result["ok"] is False
         assert "unknown" in result.get("error", "").lower()
 
-    def test_covered_call_analysis(self):
-        """Should calculate correct P/L for a covered call."""
+    def test_covered_call_with_sell_side(self):
+        """Should calculate correct P/L for a covered call with sell side."""
         from lumibot.components.agents.options_tools import get_option_strategy_analysis
 
         strategy = _OptionsToolsStrategy()
-        strategy._last_price = 5.0  # premium
+        strategy._last_price = 450.0
         strategy._greeks = _make_mock_greeks()
+
+        # Sell 460C @ $5.00, underlying @ $450
+        _leg_prices = {"SPY_2026-07-17_460.0_CALL": 5.0}
+
+        def _priced_get_last_price(asset, quote=None, exchange=None):
+            atype = str(getattr(asset, "asset_type", ""))
+            if "option" in atype.lower():
+                key = f"{asset.symbol}_{asset.expiration}_{asset.strike}_{asset.right}"
+                return _leg_prices.get(key, 1.0)
+            return 450.0
+
+        strategy.get_last_price = _priced_get_last_price
 
         result = get_option_strategy_analysis(
             strategy,
@@ -415,9 +608,12 @@ class TestGetOptionStrategyAnalysis:
             strikes=[460.0],
             expiration="2026-07-17",
             option_type="call",
+            leg_sides=["sell"],
         )
 
         assert result["ok"] is True
+        # Net credit = $5.00 per share
+        assert result["net_debit_credit"] == pytest.approx(5.0, rel=0.01)
         assert result["max_profit"] is not None
         assert len(result["breakevens"]) == 1
 
