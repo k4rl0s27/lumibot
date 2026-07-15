@@ -585,7 +585,7 @@ class TelegramBot:
             positions = strategy.get_positions()
 
             unrealized_pl = sum(
-                getattr(p, "unrealized_profit_loss", 0) or 0
+                getattr(p, "pnl", 0) or 0
                 for p in (positions or [])
             )
             pnl_pct = (unrealized_pl / portfolio_value * 100) if portfolio_value and portfolio_value > 0 else 0
@@ -631,7 +631,7 @@ class TelegramBot:
                     asset_type = getattr(getattr(pos, "asset", None), "asset_type", "stock")
                     qty = getattr(pos, "quantity", 0) or 0
                     market_value = getattr(pos, "market_value", 0) or 0
-                    unrealized_pl = getattr(pos, "unrealized_profit_loss", 0) or 0
+                    unrealized_pl = getattr(pos, "pnl", 0) or 0
                     pnl_pct = (unrealized_pl / (market_value - unrealized_pl) * 100) if (market_value - unrealized_pl) != 0 else 0
 
                     type_tag = ""
@@ -673,7 +673,7 @@ class TelegramBot:
                 avg_price = getattr(pos, "avg_fill_price", None)
                 last_price = getattr(pos, "last_price", None)
                 market_value = getattr(pos, "market_value", 0) or 0
-                unrealized_pl = getattr(pos, "unrealized_profit_loss", 0) or 0
+                unrealized_pl = getattr(pos, "pnl", 0) or 0
 
                 asset = getattr(pos, "asset", None)
                 asset_type = getattr(asset, "asset_type", "stock") if asset else "unknown"

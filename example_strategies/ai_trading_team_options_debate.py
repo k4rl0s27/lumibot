@@ -183,15 +183,13 @@ RULES:
 - Only trade symbols from the provided universe.
 - If trading, you MUST be specific about exact strikes, expirations, and quantities. Generic statements are not actionable.
 
-ACCOUNT RESTRICTION (Level 1): Your account is approved for Level 1 options
-trading only. You may ONLY use these two strategies:
-  - Covered Call (buy stock + sell call against it)
-  - Cash-Secured Put (sell put, fully cash-backed)
-Do NOT propose spreads, straddles, strangles, iron condors, butterflies,
-or any multi-leg option strategy. Do NOT sell naked calls or buy options
-without the corresponding stock or cash position. If the best trade idea
-requires a higher level, state "PASS — requires Level 3+" and recommend
-buying/selling the underlying stock as a simpler alternative.
+ACCOUNT RESTRICTION (Level 3): Your account is approved for Level 3 options
+trading. You may use covered calls, cash-secured puts, vertical spreads
+(bull put, bear call, etc.), iron condors, butterflies, and calendar
+spreads. All strategies must be defined-risk — max loss known upfront.
+Do NOT use naked options, straddles, strangles, or uncovered calls/puts.
+Do NOT buy or sell the underlying stock — this strategy trades OPTIONS ONLY.
+If no suitable defined-risk options trade exists, state PASS.
 
 You have access to the built-in order tools (submit_order, etc.). Use them only after human approval is received — the strategy will handle the approval gate."""
 
@@ -552,6 +550,12 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
                 f"[5/5] SKIP_HUMAN_APPROVAL=true — {len(pm_submitted_orders)} order(s) "
                 f"auto-approved. Verify in Tradier dashboard.",
                 color="green",
+            )
+            self.notify(
+                title="🤖 Trade Auto-Approved",
+                message=f"{len(pm_submitted_orders)} order(s) submitted to Tradier paper.\n\n"
+                f"{decision_text[:800]}",
+                severity="info",
             )
             self.memory.remember_decision(
                 f"AUTO-APPROVED: {decision_text[:300]}",

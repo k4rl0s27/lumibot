@@ -112,10 +112,30 @@ def bind_callable_tool(callable_obj: Callable[..., Any]) -> ToolDefinition:
     tool_description = metadata.get("description") or _build_description(callable_obj, None)
 
     def binder(strategy: Any, manager: Any) -> BoundTool:
+        # Capture strategy in a closure so the agent runtime doesn't need to
+        # pass it as a parameter. Mirrors the builtin-tool binder pattern.
+        # We strip 'self' from the visible signature so ADK's schema generation
+        # doesn't expose it to the LLM as a callable parameter.
+        import functools
+
+        @functools.wraps(callable_obj)
+        def _wrapped(*args: Any, **kwargs: Any) -> Any:
+            return callable_obj(strategy, *args, **kwargs)
+
+        # Remove 'self' from the wrapper's inspectable signature
+        try:
+            orig_sig = inspect.signature(callable_obj)
+            new_params = [
+                p for name, p in orig_sig.parameters.items() if name != "self"
+            ]
+            _wrapped.__signature__ = orig_sig.replace(parameters=new_params)
+        except (TypeError, ValueError):
+            pass
+
         return BoundTool(
             name=tool_name,
             description=tool_description,
-            function=callable_obj,
+            function=_wrapped,
             source="local",
             metadata={
                 "kind": "callable",
