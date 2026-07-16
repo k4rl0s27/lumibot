@@ -130,7 +130,10 @@ def bind_callable_tool(callable_obj: Callable[..., Any]) -> ToolDefinition:
             ]
             _wrapped.__signature__ = orig_sig.replace(parameters=new_params)
         except (TypeError, ValueError):
-            pass
+            logger.warning(
+                "Could not inspect signature for tool %s — LLM may see 'self' parameter.",
+                tool_name,
+            )
 
         return BoundTool(
             name=tool_name,

@@ -117,7 +117,11 @@ class TelegramBot:
             return
 
         self._application = Application.builder().token(self.bot_token).build()
-        self._loop = asyncio.get_event_loop()
+
+        # Python 3.10+ requires explicit event loop in non-main threads
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        self._loop = loop
 
         self._application.add_handler(CommandHandler("start", self._cmd_start))
         self._application.add_handler(CommandHandler("help", self._cmd_help))
@@ -183,10 +187,15 @@ class TelegramBot:
     # Command handlers
     # ------------------------------------------------------------------
 
-    async def _cmd_start(self, update: Any, context: Any) -> None:
+    async def _check_auth(self, update: Any) -> bool:
         chat_id = update.effective_chat.id
         if not self._ensure_authorized(chat_id):
-            await update.message.reply_text("\u26d4 You are not authorized to use this bot.")
+            await update.message.reply_text("\u26d4 Unauthorized.")
+            return False
+        return True
+
+    async def _cmd_start(self, update: Any, context: Any) -> None:
+        if not await self._check_auth(update):
             return
 
         welcome = (
@@ -204,29 +213,20 @@ class TelegramBot:
         await self._cmd_start(update, context)
 
     async def _cmd_status(self, update: Any, context: Any) -> None:
-        chat_id = update.effective_chat.id
-        if not self._ensure_authorized(chat_id):
-            await update.message.reply_text("\u26d4 Unauthorized.")
+        if not await self._check_auth(update):
             return
-
         status_text = self._build_status_text()
         await update.message.reply_text(status_text, parse_mode="HTML")
 
     async def _cmd_portfolio(self, update: Any, context: Any) -> None:
-        chat_id = update.effective_chat.id
-        if not self._ensure_authorized(chat_id):
-            await update.message.reply_text("\u26d4 Unauthorized.")
+        if not await self._check_auth(update):
             return
-
         portfolio_text = self._build_portfolio_text()
         await update.message.reply_text(portfolio_text, parse_mode="HTML")
 
     async def _cmd_positions(self, update: Any, context: Any) -> None:
-        chat_id = update.effective_chat.id
-        if not self._ensure_authorized(chat_id):
-            await update.message.reply_text("\u26d4 Unauthorized.")
+        if not await self._check_auth(update):
             return
-
         positions_text = self._build_positions_text()
         await update.message.reply_text(positions_text, parse_mode="HTML")
 

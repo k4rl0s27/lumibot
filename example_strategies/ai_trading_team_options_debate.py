@@ -219,7 +219,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
     # ==================================================================
 
     def initialize(self):
-        self.sleeptime = "1D"
+        self.sleeptime = os.environ.get("SLEEPTIME", "1D")
 
         # ---- Telegram Bot (monitoring + status queries) ----
         from lumibot.components.notifications import TelegramBot
@@ -231,10 +231,13 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
         )
         self.telegram_bot.start()
 
-        # Outbound notifications (via existing notification system)
-        self.notifications.configure_telegram(
-            bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
-            chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+        # ---- Run Logger (markdown audit trail per cycle) ----
+        from lumibot.components.notifications import RunLogger
+
+        self.run_logger = RunLogger(
+            log_dir=os.environ.get("RUN_LOG_DIR", "./logs"),
+            strategy_name=self.__class__.__name__,
+            telegram_bot=self.telegram_bot,
         )
 
         # ---- Agent Models ----
@@ -317,78 +320,66 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
         self.log_message("Options Debate Strategy initialized with 7 agents.", color="green")
 
     # ==================================================================
-    # Lifecycle: Before Trading
-    # ==================================================================
-
-    def before_market_closes(self):
-        pass
-
-    # ==================================================================
     # Lifecycle: On Trading Iteration
     # ==================================================================
 
     def on_trading_iteration(self):
         universe = self.parameters["universe"]
         today = self.get_datetime().date().isoformat()
-
-        self.log_message(f"=== Options Debate Cycle: {today} ===", color="yellow")
-        self.log_message(f"Universe: {', '.join(universe)}", color="yellow")
-
-        context_base = {
-            "date": today,
-            "universe": universe,
+        params = {
             "min_dte": self.parameters["min_dte"],
             "max_dte": self.parameters["max_dte"],
             "max_loss_per_trade_pct": self.parameters["max_loss_per_trade_pct"],
         }
 
+        self.log_message(f"=== Options Debate Cycle: {today} ===", color="yellow")
+        self.log_message(f"Universe: {', '.join(universe)}", color="yellow")
+
+        self.run_logger.start_cycle(today, universe, params)
+
+        context_base = {"date": today, "universe": universe, **params}
+
         # ---- Phase 1: RESEARCH ----
 
         self.log_message("[1/4] Running research analysts...", color="blue")
 
-        self.log_message("  -> Macro Analyst researching market regime...", color="blue")
-        macro_result = self.agents["macro_analyst"].run(
-            task_prompt=(
-                f"Analyze the current market regime for options trading. "
-                f"Evaluate VIX, interest rates, sector trends, and macro events. "
-                f"Recommend the most appropriate options strategy type "
-                f"(directional, neutral/income, volatility, or defensive/hedge) "
-                f"for each symbol in the universe: {', '.join(universe)}. "
-                f"Use the get_options_market_snapshot tool to get real data. "
-                f"Today's date is {today}."
-            ),
+        macro_text = self._run_agent(
+            "macro_analyst",
+            "Phase 1: Research",
+            f"Analyze the current market regime for options trading. "
+            f"Evaluate VIX, interest rates, sector trends, and macro events. "
+            f"Recommend the most appropriate options strategy type "
+            f"(directional, neutral/income, volatility, or defensive/hedge) "
+            f"for each symbol in the universe: {', '.join(universe)}. "
+            f"Use the get_options_market_snapshot tool to get real data. "
+            f"Today's date is {today}.",
             context=context_base,
         )
-        self.log_message("  <- Macro Analyst done.", color="blue")
 
-        self.log_message("  -> Technical Analyst reviewing price action...", color="blue")
-        technical_result = self.agents["technical_analyst"].run(
-            task_prompt=(
-                f"Analyze the technical setup for each symbol in the universe: "
-                f"{', '.join(universe)}. For each, provide directional bias "
-                f"(bullish/bearish/neutral), confidence level, approximate strike "
-                f"zone, and key support/resistance levels. Use the built-in "
-                f"indicator and price history tools. Today's date is {today}."
-            ),
+        technical_text = self._run_agent(
+            "technical_analyst",
+            "Phase 1: Research",
+            f"Analyze the technical setup for each symbol in the universe: "
+            f"{', '.join(universe)}. For each, provide directional bias "
+            f"(bullish/bearish/neutral), confidence level, approximate strike "
+            f"zone, and key support/resistance levels. Use the built-in "
+            f"indicator and price history tools. Today's date is {today}.",
             context=context_base,
         )
-        self.log_message("  <- Technical Analyst done.", color="blue")
 
-        self.log_message("  -> Options Analyst querying chains and Greeks...", color="blue")
-        options_result = self.agents["options_analyst"].run(
-            task_prompt=(
-                f"Query options chains for the symbols in the universe: "
-                f"{', '.join(universe)}. Use get_option_chain_summary for each. "
-                f"Evaluate liquidity, IV vs HV, and risk/reward. "
-                f"Recommend specific contracts (strikes, expirations, call/put) "
-                f"based on the strategy types suggested by the macro analyst. "
-                f"Prefer {self.parameters['min_dte']}-{self.parameters['max_dte']} DTE. "
-                f"Use get_options_market_snapshot first, then get_option_chain_summary, "
-                f"then get_option_strategy_analysis to validate. Today's date is {today}."
-            ),
+        options_text = self._run_agent(
+            "options_analyst",
+            "Phase 1: Research",
+            f"Query options chains for the symbols in the universe: "
+            f"{', '.join(universe)}. Use get_option_chain_summary for each. "
+            f"Evaluate liquidity, IV vs HV, and risk/reward. "
+            f"Recommend specific contracts (strikes, expirations, call/put) "
+            f"based on the strategy types suggested by the macro analyst. "
+            f"Prefer {self.parameters['min_dte']}-{self.parameters['max_dte']} DTE. "
+            f"Use get_options_market_snapshot first, then get_option_chain_summary, "
+            f"then get_option_strategy_analysis to validate. Today's date is {today}.",
             context=context_base,
         )
-        self.log_message("  <- Options Analyst done.", color="blue")
 
         # ---- Phase 2: DEBATE ----
 
@@ -396,121 +387,106 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
 
         research_context = {
             **context_base,
-            "macro_analysis": macro_result.summary or macro_result.text,
-            "technical_analysis": technical_result.summary or technical_result.text,
-            "options_analysis": options_result.summary or options_result.text,
+            "macro_analysis": macro_text,
+            "technical_analysis": technical_text,
+            "options_analysis": options_text,
         }
 
-        self.log_message("  -> Bull Case building thesis...", color="blue")
-        bull_result = self.agents["bull_case"].run(
-            task_prompt=(
-                f"Build the strongest possible bull case for the best options trade "
-                f"identified by the research team. Use the macro, technical, and "
-                f"options analysis below. Advocate with conviction — reference "
-                f"specific data points, Greeks, and risk/reward numbers. "
-                f"Engage with potential bear objections preemptively."
-            ),
+        bull_text = self._run_agent(
+            "bull_case",
+            "Phase 2: Debate",
+            f"Build the strongest possible bull case for the best options trade "
+            f"identified by the research team. Use the macro, technical, and "
+            f"options analysis below. Advocate with conviction — reference "
+            f"specific data points, Greeks, and risk/reward numbers. "
+            f"Engage with potential bear objections preemptively.",
             context=research_context,
         )
-        self.log_message("  <- Bull Case done.", color="blue")
 
-        self.log_message("  -> Bear Case stress-testing...", color="blue")
-        bear_result = self.agents["bear_case"].run(
-            task_prompt=(
-                f"Stress-test the options trade proposed by the research team. "
-                f"Find every risk, failure mode, and reason to pass. "
-                f"Challenge assumptions in the bull thesis. "
-                f"Check for: earnings risk, volatility crush, liquidity traps, "
-                f"correlation breaks, tail risk, and sizing concerns. "
-                f"Directly reference the bull case below and counter its arguments. "
-                f"Use specific numbers from the research — where is the thesis weakest?"
-            ),
-            context={
-                **research_context,
-                "bull_case": bull_result.summary or bull_result.text,
-            },
+        bear_text = self._run_agent(
+            "bear_case",
+            "Phase 2: Debate",
+            f"Stress-test the options trade proposed by the research team. "
+            f"Find every risk, failure mode, and reason to pass. "
+            f"Challenge assumptions in the bull thesis. "
+            f"Check for: earnings risk, volatility crush, liquidity traps, "
+            f"correlation breaks, tail risk, and sizing concerns. "
+            f"Directly reference the bull case below and counter its arguments. "
+            f"Use specific numbers from the research — where is the thesis weakest?",
+            context={**research_context, "bull_case": bull_text},
         )
-        self.log_message("  <- Bear Case done.", color="blue")
 
         # ---- Phase 3: RISK REVIEW ----
 
         self.log_message("[3/4] Running risk assessment...", color="blue")
-        risk_result = self.agents["risk_manager"].run(
-            task_prompt=(
-                f"Assess portfolio-level risk for the proposed options trade. "
-                f"Use the get_portfolio_greeks_summary tool to get current exposure. "
-                f"Evaluate: correlation risk, Greek impact, concentration, drawdown, "
-                f"sizing, and whether max loss is acceptable for the account. "
-                f"If no current positions, evaluate on a standalone basis. "
-                f"Output: APPROVE, REDUCE SIZE (specify new size), or REJECT. "
-                f"Max loss per trade should not exceed "
-                f"{self.parameters['max_loss_per_trade_pct']}% of portfolio."
-            ),
-            context={
-                **research_context,
-                "bull_case": bull_result.summary or bull_result.text,
-                "bear_case": bear_result.summary or bear_result.text,
-            },
+
+        risk_text = self._run_agent(
+            "risk_manager",
+            "Phase 3: Risk Review",
+            f"Assess portfolio-level risk for the proposed options trade. "
+            f"Use the get_portfolio_greeks_summary tool to get current exposure. "
+            f"Evaluate: correlation risk, Greek impact, concentration, drawdown, "
+            f"sizing, and whether max loss is acceptable for the account. "
+            f"If no current positions, evaluate on a standalone basis. "
+            f"Output: APPROVE, REDUCE SIZE (specify new size), or REJECT. "
+            f"Max loss per trade should not exceed "
+            f"{self.parameters['max_loss_per_trade_pct']}% of portfolio.",
+            context={**research_context, "bull_case": bull_text, "bear_case": bear_text},
         )
-        self.log_message("  <- Risk Manager done.", color="blue")
 
         # ---- Phase 4: DECISION + EXECUTE ----
 
         self.log_message("[4/4] Portfolio Manager making final decision...", color="blue")
-        pm_result = self.agents["portfolio_manager"].run(
-            task_prompt=(
-                f"Synthesize ALL research, debate, and risk analysis into a final "
-                f"decision: TRADE or PASS.\n\n"
-                f"If TRADE: Be specific about exact strikes, expirations, quantities, "
-                f"and limit prices for each leg. Use defined-risk strategies. "
-                f"Max loss {self.parameters['max_loss_per_trade_pct']}% of portfolio. "
-                f"Submit orders directly using submit_order.\n\n"
-                f"If PASS: Explain why and what would change your mind.\n\n"
-                f"Universe: {', '.join(universe)}. Today: {today}."
-            ),
+
+        decision_text = self._run_agent(
+            "portfolio_manager",
+            "Phase 4: Decision",
+            f"Synthesize ALL research, debate, and risk analysis into a final "
+            f"decision: TRADE or PASS.\n\n"
+            f"If TRADE: Be specific about exact strikes, expirations, quantities, "
+            f"and limit prices for each leg. Use defined-risk strategies. "
+            f"Max loss {self.parameters['max_loss_per_trade_pct']}% of portfolio. "
+            f"Submit orders directly using submit_order.\n\n"
+            f"If PASS: Explain why and what would change your mind.\n\n"
+            f"Universe: {', '.join(universe)}. Today: {today}.",
             context={
                 **research_context,
-                "bull_case": bull_result.summary or bull_result.text,
-                "bear_case": bear_result.summary or bear_result.text,
-                "risk_assessment": risk_result.summary or risk_result.text,
+                "bull_case": bull_text,
+                "bear_case": bear_text,
+                "risk_assessment": risk_text,
             },
         )
-        decision_text = pm_result.summary or pm_result.text
-        self.log_message(f"  <- Portfolio Manager decision:\n{decision_text}", color="green")
 
-        # Notify via Telegram + outbound notification
         is_trade = "FINAL DECISION: TRADE" in decision_text
 
-        if is_trade:
-            self.telegram_bot.send_message(
-                f"<b>\U0001f4c8 Trade Executed</b>\n\n{decision_text[:1500]}"
-            )
-            self.notify(
-                title="Options Debate — TRADE",
-                message=decision_text[:800],
-                severity="info",
-            )
-            self.memory.remember_decision(
-                f"EXECUTED: {decision_text[:300]}",
-                symbol=",".join(universe),
-                action="buy",
-            )
-        else:
-            self.telegram_bot.send_message(
-                f"<b>\U0001f4ed PASS — No Trade Today</b>\n\n{decision_text[:1000]}"
-            )
-            self.notify(
-                title="Options Debate — PASS",
-                message=f"No trade today.\n\n{decision_text[:500]}",
-                severity="info",
-            )
-            self.memory.remember_decision(
-                f"PASS: {decision_text[:300]}",
-                symbol=",".join(universe),
-                action="hold",
-            )
+        # Write markdown log + send single Telegram notification
+        self.run_logger.finalize(decision_text, is_trade=is_trade)
+
+        self.memory.remember_decision(
+            f"{'EXECUTED' if is_trade else 'PASS'}: {decision_text[:300]}",
+            symbol=",".join(universe),
+            action="buy" if is_trade else "hold",
+        )
 
         self.log_message(f"=== Options Debate Cycle Complete: {today} ===", color="yellow")
+
+    # ------------------------------------------------------------------
+    # Agent runner helper
+    # ------------------------------------------------------------------
+
+    def _run_agent(self, agent_name: str, phase: str, task_prompt: str, context: dict | None = None) -> str:
+        self.log_message(f"  -> {agent_name} running...", color="blue")
+        try:
+            result = self.agents[agent_name].run(task_prompt=task_prompt, context=context)
+            output = result.summary or result.text or ""
+            self.run_logger.log_agent_output(phase, agent_name, output)
+            self.log_message(f"  <- {agent_name} done.", color="blue")
+            return output
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {e}"
+            self.run_logger.log_error(phase, agent_name, error_msg)
+            self.log_message(f"  <- {agent_name} ERROR: {error_msg}", color="red")
+            return ""
 
 
 # ======================================================================

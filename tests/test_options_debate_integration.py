@@ -258,10 +258,17 @@ class TestTradingIterationFlow:
         strategy.telegram_bot.send_message = MagicMock()
         strategy.telegram_bot.start = MagicMock()
 
+        # Mock RunLogger (send_message goes through finalize now)
+        strategy.run_logger = MagicMock()
+        strategy.run_logger.start_cycle = MagicMock()
+        strategy.run_logger.log_agent_output = MagicMock()
+        strategy.run_logger.log_error = MagicMock()
+        strategy.run_logger.finalize = MagicMock()
+
         return strategy
 
     def test_pass_decision_notifies_and_logs(self, mock_telegram_bot):
-        """When PM decides PASS, should notify Telegram and log to memory."""
+        """When PM decides PASS, should finalize logger and log to memory."""
         strategy = self._make_strategy_with_mocked_agents(mock_telegram_bot)
 
         pass_result = SimpleNamespace(
@@ -271,26 +278,19 @@ class TestTradingIterationFlow:
             warning_messages=[],
         )
 
-        def _run_side_effect(task_prompt, context=None):
-            if "Synthesize ALL research" in str(task_prompt or ""):
-                return pass_result
-            if "portfolio_manager" in str(context or ""):
-                return pass_result
-            return SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[])
-
         for agent_name in ["macro_analyst", "technical_analyst", "options_analyst",
                            "bull_case", "bear_case", "risk_manager", "portfolio_manager"]:
-            strategy.agents[agent_name].run = MagicMock(side_effect=_run_side_effect)
+            strategy.agents[agent_name].run = MagicMock(return_value=pass_result)
 
         strategy.on_trading_iteration()
 
-        strategy.telegram_bot.send_message.assert_called_once()
+        strategy.run_logger.finalize.assert_called_once()
+        assert strategy.run_logger.finalize.call_args.kwargs["is_trade"] is False
         strategy.memory.remember_decision.assert_called_once()
-        call_args = strategy.memory.remember_decision.call_args[0][0]
-        assert "PASS" in call_args
+        assert "PASS" in strategy.memory.remember_decision.call_args[0][0]
 
     def test_trade_decision_notifies_telegram(self, mock_telegram_bot):
-        """When PM decides TRADE, should notify Telegram with trade details."""
+        """When PM decides TRADE, should finalize logger with is_trade=True."""
         strategy = self._make_strategy_with_mocked_agents(mock_telegram_bot)
 
         trade_decision = (
@@ -303,22 +303,16 @@ class TestTradingIterationFlow:
         )
         trade_result = SimpleNamespace(summary=trade_decision, text=trade_decision, cache_hit=True, warning_messages=[])
 
-        def _run_side_effect(task_prompt, context=None):
-            if "Synthesize ALL research" in str(task_prompt or ""):
-                return trade_result
-            if "portfolio_manager" in str(context or ""):
-                return trade_result
-            return SimpleNamespace(summary="ok", text="ok", cache_hit=True, warning_messages=[])
-
         for agent_name in ["macro_analyst", "technical_analyst", "options_analyst",
                            "bull_case", "bear_case", "risk_manager", "portfolio_manager"]:
-            strategy.agents[agent_name].run = MagicMock(side_effect=_run_side_effect)
+            strategy.agents[agent_name].run = MagicMock(return_value=trade_result)
 
         strategy.on_trading_iteration()
 
-        strategy.telegram_bot.send_message.assert_called_once()
-        msg_arg = strategy.telegram_bot.send_message.call_args[0][0]
-        assert "Trade" in msg_arg
+        strategy.run_logger.finalize.assert_called_once()
+        assert strategy.run_logger.finalize.call_args.kwargs["is_trade"] is True
+        strategy.memory.remember_decision.assert_called_once()
+        assert "EXECUTED" in strategy.memory.remember_decision.call_args[0][0]
 
     def test_all_agents_called_in_correct_order(self, mock_telegram_bot):
         """Agents should be called in the order: macro, technical, options, bull, bear, risk, PM."""

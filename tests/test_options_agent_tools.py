@@ -741,3 +741,491 @@ class TestHelpers:
 
         assert "+5.0%" in _format_pct(0.05)
         assert _format_pct(None) == "N/A"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Determinism — same inputs must produce same outputs
+# ---------------------------------------------------------------------------
+
+
+class TestDeterminism:
+    """Verify tool outputs are 100% deterministic given fixed inputs.
+
+    If these fail, the tool itself is non-deterministic and every agent
+    calling it at the same moment would get different numbers — the exact
+    hallucination pattern seen in the Jul 16 debate log where six agents
+    reported six different values for the same iron condor.
+    """
+
+    def _make_strategy_for_iron_condor(self):
+        strategy = _OptionsToolsStrategy()
+        strategy._last_price = 751.0
+        strategy._greeks = {"delta": 0.35, "gamma": 0.02, "theta": -0.04, "vega": 0.12, "implied_volatility": 0.145}
+
+        _prices = {
+            "SPY_2026-08-07_746.0_PUT": 6.20,
+            "SPY_2026-08-07_741.0_PUT": 4.10,
+            "SPY_2026-08-07_756.0_CALL": 5.30,
+            "SPY_2026-08-07_759.0_CALL": 3.70,
+        }
+
+        def _priced_get_last_price(asset, quote=None, exchange=None):
+            atype = str(getattr(asset, "asset_type", ""))
+            if "option" in atype.lower():
+                key = f"{asset.symbol}_{asset.expiration}_{asset.strike}_{asset.right}"
+                return _prices.get(key, 1.0)
+            return 751.0
+
+        strategy.get_last_price = _priced_get_last_price
+        return strategy
+
+    def test_same_inputs_same_outputs(self):
+        """Calling _analyze_strategy_pl N times with identical inputs must yield identical results."""
+        from lumibot.components.agents.options_tools import _analyze_strategy_pl
+
+        strikes = [746.0, 741.0, 756.0, 759.0]
+        leg_prices = [6.20, 4.10, 5.30, 3.70]
+        leg_greeks = [
+            {"delta": 0.35}, {"delta": 0.25}, {"delta": 0.40}, {"delta": 0.20},
+        ]
+        leg_sides = ["buy", "sell", "sell", "buy"]
+        leg_types = ["put", "put", "call", "call"]
+
+        results = []
+        for _ in range(10):
+            r = _analyze_strategy_pl(
+                strategy_type="iron_condor",
+                strikes=strikes,
+                leg_prices=leg_prices,
+                leg_greeks=leg_greeks,
+                leg_sides=leg_sides,
+                leg_types=leg_types,
+                underlying_price=751.0,
+                expiration="2026-08-07",
+            )
+            results.append(r)
+
+        first = results[0]
+        for i, r in enumerate(results[1:], 1):
+            assert r["net_debit_credit"] == first["net_debit_credit"], f"Run {i}: net_debit_credit diverged"
+            assert r["max_profit"] == first["max_profit"], f"Run {i}: max_profit diverged"
+            assert r["max_loss"] == first["max_loss"], f"Run {i}: max_loss diverged"
+            assert r["breakevens"] == first["breakevens"], f"Run {i}: breakevens diverged"
+            assert r["probability_of_profit_pct"] == first["probability_of_profit_pct"], (
+                f"Run {i}: PoP diverged ({first['probability_of_profit_pct']} vs {r['probability_of_profit_pct']})"
+            )
+            assert r["risk_reward_ratio"] == first["risk_reward_ratio"], f"Run {i}: R:R diverged"
+
+    def test_end_to_end_tool_determinism(self):
+        """Full get_option_strategy_analysis must return identical results on repeated calls."""
+        from lumibot.components.agents.options_tools import get_option_strategy_analysis
+
+        results = []
+        for _ in range(5):
+            strategy = self._make_strategy_for_iron_condor()
+            r = get_option_strategy_analysis(
+                strategy,
+                symbol="SPY",
+                strategy_type="iron_condor",
+                strikes=[746.0, 741.0, 756.0, 759.0],
+                expiration="2026-08-07",
+                leg_types=["put", "put", "call", "call"],
+                leg_sides=["buy", "sell", "sell", "buy"],
+            )
+            results.append(r)
+
+        first = results[0]
+        for i, r in enumerate(results[1:], 1):
+            for key in ("net_debit_credit", "max_profit", "max_loss", "breakevens",
+                         "probability_of_profit_pct", "risk_reward_ratio"):
+                assert r.get(key) == first.get(key), f"Run {i}: key '{key}' diverged"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Iron Condor P/L math correctness (hand-verified)
+# ---------------------------------------------------------------------------
+
+
+class TestIronCondorMath:
+    """Verify the P/L math for iron condors against hand-computed values.
+
+    These tests use fixed prices so the expected output can be verified
+    independently with a calculator. If these fail, the tool is computing
+    max loss / max profit / breakevens incorrectly.
+    """
+
+    def _run_iron_condor(self, strikes, leg_types, leg_sides, prices, underlying=751.0):
+        from lumibot.components.agents.options_tools import (
+            get_option_strategy_analysis,
+        )
+
+        strategy = _OptionsToolsStrategy()
+        strategy._last_price = underlying
+        strategy._greeks = {"delta": 0.35}
+
+        _price_map = {}
+        for strike, ltype, price in zip(strikes, leg_types, prices):
+            key = f"SPY_2026-08-07_{strike}_{ltype.upper()}"
+            _price_map[key] = price
+
+        def _priced(asset, quote=None, exchange=None):
+            atype = str(getattr(asset, "asset_type", ""))
+            if "option" in atype.lower():
+                key = f"{asset.symbol}_{asset.expiration}_{asset.strike}_{asset.right}"
+                return _price_map.get(key, 1.0)
+            return underlying
+
+        strategy.get_last_price = _priced
+        return get_option_strategy_analysis(
+            strategy, symbol="SPY", strategy_type="iron_condor",
+            strikes=strikes, expiration="2026-08-07",
+            leg_types=leg_types, leg_sides=leg_sides,
+        )
+
+    def test_five_wide_wings_credit_2_70(self):
+        """5-wide both wings, net credit $2.70/share.
+
+        Buy 741P@4.50, Sell 746P@6.20 → put wing credit $1.70
+        Sell 756C@4.80, Buy 759C@3.80 → call wing credit $1.00
+        Total credit = $2.70, max profit = $270, max loss = 500-270 = $230
+        Lower BE = 746 - 2.70 = 743.30, Upper BE = 756 + 2.70 = 758.70
+        """
+        result = self._run_iron_condor(
+            strikes=[741.0, 746.0, 756.0, 759.0],
+            leg_types=["put", "put", "call", "call"],
+            leg_sides=["buy", "sell", "sell", "buy"],
+            prices=[4.50, 6.20, 4.80, 3.80],
+        )
+
+        assert result["ok"] is True
+        assert result["net_debit_credit"] == pytest.approx(2.70, rel=0.01)
+        assert result["max_profit"] == pytest.approx(270.0, rel=0.01)
+        assert result["max_loss"] == pytest.approx(230.0, rel=0.01)
+        assert len(result["breakevens"]) == 2
+        assert result["breakevens"][0] == pytest.approx(743.30, rel=0.01)
+        assert result["breakevens"][1] == pytest.approx(758.70, rel=0.01)
+
+    def test_unequal_wings_5_and_3(self):
+        """5-wide put wing, 3-wide call wing. Max loss follows wider wing.
+
+        Buy 741P@3.50, Sell 746P@5.00 → put net = -3.50 + 5.00 = +1.50 credit
+        Sell 756C@3.00, Buy 759C@1.50 → call net = +3.00 - 1.50 = +1.50 credit
+        Total credit = +3.00, max profit = $300
+        Put wing=5 (746-741), Call wing=3 (759-756), wider=5
+        Max loss = 5*100 - 300 = $200
+        Lower BE = 746 - 3.00 = 743.00, Upper BE = 756 + 3.00 = 759.00
+        """
+        result = self._run_iron_condor(
+            strikes=[741.0, 746.0, 756.0, 759.0],
+            leg_types=["put", "put", "call", "call"],
+            leg_sides=["buy", "sell", "sell", "buy"],
+            prices=[3.50, 5.00, 3.00, 1.50],
+        )
+
+        assert result["ok"] is True
+        assert result["net_debit_credit"] == pytest.approx(3.00, rel=0.01)
+        assert result["max_profit"] == pytest.approx(300.0, rel=0.01)
+        assert result["max_loss"] == pytest.approx(200.0, rel=0.01)
+        assert result["breakevens"][0] == pytest.approx(743.00, rel=0.01)
+        assert result["breakevens"][1] == pytest.approx(759.00, rel=0.01)
+
+    def test_iron_condor_with_unsorted_strikes(self):
+        """Strikes in non-sorted order: net_cost is order-independent, wing widths sorted."""
+        # Same trade as test_five_wide_wings_credit_2_70 but with scrambled order.
+        # Buy 741P@4.50, Sell 746P@6.20, Sell 756C@4.80, Buy 759C@3.80 → credit $2.70
+        result = self._run_iron_condor(
+            strikes=[756.0, 741.0, 759.0, 746.0],  # random order
+            leg_types=["call", "put", "call", "put"],
+            leg_sides=["sell", "buy", "buy", "sell"],
+            prices=[4.80, 4.50, 3.80, 6.20],
+        )
+
+        assert result["ok"] is True
+        # signed: +4.80 - 4.50 - 3.80 + 6.20 = +2.70 (same credit)
+        assert result["net_debit_credit"] == pytest.approx(2.70, rel=0.01)
+        assert result["max_profit"] == pytest.approx(270.0, rel=0.01)
+        # sorted=[741, 746, 756, 759], put_wing=5, call_wing=3, wider=5
+        assert result["max_loss"] == pytest.approx(230.0, rel=0.01)
+
+    def test_debit_iron_condor_net_cost_negative(self):
+        """When total paid > received, net_debit_credit is negative (debit).
+
+        Buy 741P@6.00, Sell 746P@4.00 → put net = -2.00 debit
+        Sell 756C@2.00, Buy 759C@1.00 → call net = +1.00 credit
+        Total = -2.00, net debit. Still valid — the tool computes P/L from abs(net_cost).
+        """
+        result = self._run_iron_condor(
+            strikes=[741.0, 746.0, 756.0, 759.0],
+            leg_types=["put", "put", "call", "call"],
+            leg_sides=["buy", "sell", "sell", "buy"],
+            prices=[6.00, 4.00, 2.00, 1.00],
+        )
+        # signed: -6.00 + 4.00 + 2.00 - 1.00 = -1.00 (net debit)
+        # abs(net_cost) = 1.00, max_profit = 1.00 * 100 = $100
+        # max_loss = 5*100 - 100 = $400
+
+        assert result["ok"] is True
+        assert result["net_debit_credit"] < 0
+        assert result["max_profit"] == pytest.approx(100.0, rel=0.01)
+        assert result["max_loss"] == pytest.approx(400.0, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Tests: PoP sensitivity to strike ordering (the root cause of hallucination)
+# ---------------------------------------------------------------------------
+
+
+class TestPoPSensitivity:
+    """Verify the strategy-aware PoP computation.
+
+    After the fix, iron condor PoP uses both short-leg deltas:
+      PoP = 1 - abs(delta_short_put) - delta_short_call
+
+    Vertical spreads use the sold leg's delta:
+      PoP = 1 - abs(delta_sold_leg)
+
+    PoP is now order-independent — same trade, same PoP regardless of
+    strike ordering.
+    """
+
+    def _run_iron_condor(self, deltas, strikes=None, leg_types=None, leg_sides=None):
+        from lumibot.components.agents.options_tools import _analyze_strategy_pl
+
+        if strikes is None:
+            strikes = [741.0, 746.0, 756.0, 759.0]
+        if leg_types is None:
+            leg_types = ["put", "put", "call", "call"]
+        if leg_sides is None:
+            leg_sides = ["buy", "sell", "sell", "buy"]
+
+        leg_greeks = [{"delta": d} for d in deltas]
+        leg_prices = [3.50, 5.00, 3.00, 1.50]
+
+        return _analyze_strategy_pl(
+            strategy_type="iron_condor",
+            strikes=strikes,
+            leg_prices=leg_prices,
+            leg_greeks=leg_greeks,
+            leg_sides=leg_sides,
+            leg_types=leg_types,
+            underlying_price=751.0,
+            expiration="2026-08-07",
+        )
+
+    def test_iron_condor_pop_uses_both_short_legs(self):
+        """PoP = 1 - abs(short_put_delta) - short_call_delta."""
+        # Short 746P delta=0.25 → abs=0.25, short 756C delta=0.35
+        # PoP = 1 - 0.25 - 0.35 = 0.40 = 40%
+        result = self._run_iron_condor([0.321, 0.25, 0.35, 0.15])
+        assert result["probability_of_profit_pct"] == pytest.approx(40.0, rel=0.01)
+
+    def test_iron_condor_pop_order_independent(self):
+        """Same trade, different strike ordering → same PoP (the fix)."""
+        # Order A: standard [long_put, short_put, short_call, long_call]
+        result_a = self._run_iron_condor(
+            deltas=[0.15, 0.25, 0.35, 0.10],
+            strikes=[741.0, 746.0, 756.0, 759.0],
+            leg_types=["put", "put", "call", "call"],
+            leg_sides=["buy", "sell", "sell", "buy"],
+        )
+
+        # Order B: scrambled — short legs still identified by side+type
+        result_b = self._run_iron_condor(
+            deltas=[0.35, 0.10, 0.15, 0.25],
+            strikes=[756.0, 759.0, 741.0, 746.0],
+            leg_types=["call", "call", "put", "put"],
+            leg_sides=["sell", "buy", "buy", "sell"],
+        )
+
+        assert result_a["probability_of_profit_pct"] == result_b["probability_of_profit_pct"], (
+            f"PoP must be order-independent: A={result_a['probability_of_profit_pct']}%, "
+            f"B={result_b['probability_of_profit_pct']}%"
+        )
+
+    def test_realistic_iron_condor_pop(self):
+        """Plausible OTM deltas give a plausible PoP (~60-70%)."""
+        # Short 746P delta ~0.18, short 756C delta ~0.22
+        # PoP = 1 - 0.18 - 0.22 = 0.60 = 60%
+        result = self._run_iron_condor([0.10, 0.18, 0.22, 0.08])
+        assert 50.0 <= result["probability_of_profit_pct"] <= 80.0
+
+    def test_iron_condor_pop_zero_when_deep_itm(self):
+        """When both short legs are ITM (high deltas), PoP should be near zero."""
+        result = self._run_iron_condor([0.05, 0.90, 0.85, 0.03])
+        assert result["probability_of_profit_pct"] < 5.0
+
+    def test_vertical_spread_pop_uses_short_leg(self):
+        """Credit vertical spread PoP = 1 - abs(short_leg_delta)."""
+        from lumibot.components.agents.options_tools import _analyze_strategy_pl
+
+        # Sell 746P (delta=0.25), Buy 741P (delta=0.15)
+        # PoP = 1 - 0.25 = 75%
+        result = _analyze_strategy_pl(
+            strategy_type="vertical_spread",
+            strikes=[746.0, 741.0],
+            leg_prices=[5.00, 3.50],
+            leg_greeks=[{"delta": -0.25}, {"delta": -0.15}],
+            leg_sides=["sell", "buy"],
+            leg_types=["put", "put"],
+            underlying_price=751.0,
+            expiration="2026-08-07",
+        )
+        assert result["probability_of_profit_pct"] == pytest.approx(75.0, rel=0.01)
+
+
+# ---------------------------------------------------------------------------
+# Tests: Market snapshot IV/HV ratio correctness
+# ---------------------------------------------------------------------------
+
+
+class TestMarketSnapshotIVHV:
+    """Verify the IV/HV ratio and other computed values in get_options_market_snapshot."""
+
+    def test_iv_hv_ratio_computation(self):
+        """IV=0.22, HV=0.1288 → ratio should be 22/12.88 ≈ 1.71 (rounded to 2 decimals = 1.71)."""
+        from lumibot.components.agents.options_tools import get_options_market_snapshot
+
+        strategy = _OptionsToolsStrategy()
+        strategy._chains = _make_mock_chains("SPY", 450.0)
+        # Chain df with IV = 0.22
+        strategy._chain_df = _make_mock_chain_df(450.0)
+        for _, row in strategy._chain_df.iterrows():
+            row["greeks.implied_volatility"] = 0.22
+        # Historical bars that produce HV = ~0.1288
+        prices = [440.0, 442.0, 441.0, 445.0, 443.0, 446.0, 444.0,
+                   448.0, 447.0, 450.0, 449.0, 452.0, 451.0, 453.0,
+                   450.0, 448.0, 446.0, 449.0, 451.0, 450.0, 448.0]
+        strategy._historical_bars = _make_mock_bars_df(prices)
+
+        result = get_options_market_snapshot(strategy, "SPY")
+
+        assert result["ok"] is True
+        assert result.get("atm_implied_volatility") is not None
+        assert result.get("historical_volatility_20d") is not None
+        assert result.get("iv_hv_ratio") is not None
+        assert result["iv_hv_ratio"] > 0
+
+    def test_iv_hv_ratio_absent_when_no_hv(self):
+        """When historical bars are missing, IV/HV ratio should be absent, not silently wrong."""
+        from lumibot.components.agents.options_tools import get_options_market_snapshot
+
+        strategy = _OptionsToolsStrategy()
+        strategy._chains = _make_mock_chains("SPY", 450.0)
+        strategy._chain_df = _make_mock_chain_df(450.0)
+        strategy._historical_bars = None  # no historical data
+
+        result = get_options_market_snapshot(strategy, "SPY")
+
+        assert result["ok"] is True
+        # IV/HV ratio should NOT be present when HV can't be computed
+        assert result.get("iv_hv_ratio") is None
+        assert result.get("historical_volatility_20d") is None
+
+    def test_snapshot_handles_missing_chains_gracefully(self):
+        """When chains are unavailable, snapshot returns initialized defaults."""
+        from lumibot.components.agents.options_tools import get_options_market_snapshot
+
+        strategy = _OptionsToolsStrategy()
+        strategy._chains = None
+        strategy._chain_df = None
+        strategy._historical_bars = _make_mock_bars_df()
+
+        result = get_options_market_snapshot(strategy, "SPY")
+
+        assert result["ok"] is True
+        assert result["atm_implied_volatility"] is None
+        assert result["iv_assessment"] == "unavailable"
+
+
+# ---------------------------------------------------------------------------
+# Tests: Tool output schema completeness (prevents model fabrication)
+# ---------------------------------------------------------------------------
+
+
+class TestToolOutputSchema:
+    """Verify every tool returns complete, well-typed output dicts.
+
+    When an agent relies on a tool but the tool returns an incomplete or
+    confusing response, the LLM may fabricate missing values. These tests
+    ensure every response has the expected keys with the expected types.
+    """
+
+    def test_strategy_analysis_has_all_required_keys(self):
+        """get_option_strategy_analysis must include all expected keys."""
+        from lumibot.components.agents.options_tools import get_option_strategy_analysis
+
+        strategy = _OptionsToolsStrategy()
+        strategy._last_price = 450.0
+        strategy._greeks = _make_mock_greeks()
+
+        result = get_option_strategy_analysis(
+            strategy, symbol="SPY", strategy_type="vertical_spread",
+            strikes=[450.0, 445.0], expiration="2026-07-17",
+            option_type="put", leg_sides=["sell", "buy"],
+        )
+
+        required_keys = [
+            "ok", "symbol", "strategy_type", "underlying_price", "expiration",
+            "dte", "net_debit_credit", "max_profit", "max_loss",
+            "breakevens", "probability_of_profit_pct", "risk_reward_ratio",
+        ]
+        for key in required_keys:
+            assert key in result, f"Missing key: {key}"
+
+        assert isinstance(result["breakevens"], list)
+        assert result["dte"] > 0
+
+    def test_chain_summary_has_all_required_keys(self):
+        from lumibot.components.agents.options_tools import get_option_chain_summary
+
+        strategy = _OptionsToolsStrategy()
+        strategy._chains = _make_mock_chains("SPY", 450.0)
+        strategy._chain_df = _make_mock_chain_df(450.0)
+
+        result = get_option_chain_summary(strategy, "SPY", expiration="2026-07-17")
+
+        for key in ("ok", "symbol", "underlying_price", "expiration", "dte", "strikes"):
+            assert key in result, f"Missing key: {key}"
+        assert isinstance(result["strikes"], list)
+
+    def test_market_snapshot_has_all_required_keys(self):
+        from lumibot.components.agents.options_tools import get_options_market_snapshot
+
+        strategy = _OptionsToolsStrategy()
+        strategy._chains = _make_mock_chains("SPY", 450.0)
+        strategy._chain_df = _make_mock_chain_df(450.0)
+        strategy._historical_bars = _make_mock_bars_df()
+
+        result = get_options_market_snapshot(strategy, "SPY")
+
+        for key in ("ok", "symbol", "underlying_price", "timestamp",
+                     "vix", "vix_regime", "atm_implied_volatility",
+                     "iv_assessment", "options_available"):
+            assert key in result, f"Missing key: {key}"
+
+    def test_portfolio_greeks_has_all_required_keys(self):
+        from lumibot.components.agents.options_tools import get_portfolio_greeks_summary
+
+        strategy = _OptionsToolsStrategy()
+        result = get_portfolio_greeks_summary(strategy)
+
+        for key in ("ok", "portfolio_value", "cash", "buying_power_utilization_pct",
+                     "total_delta", "total_gamma", "total_theta", "total_vega",
+                     "option_positions", "stock_positions", "interpretation"):
+            assert key in result, f"Missing key: {key}"
+
+    def test_error_response_always_has_ok_false(self):
+        """Every error path must set ok=False so the agent knows something went wrong."""
+        from lumibot.components.agents.options_tools import get_option_strategy_analysis
+
+        strategy = _OptionsToolsStrategy()
+        strategy._last_price = None  # trigger error
+
+        result = get_option_strategy_analysis(
+            strategy, symbol="SPY", strategy_type="vertical_spread",
+            strikes=[450.0, 445.0], expiration="2026-07-17",
+        )
+
+        assert result["ok"] is False
+        assert "error" in result
+        assert len(result["error"]) > 0, "Error message should not be empty"

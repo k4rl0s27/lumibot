@@ -102,7 +102,7 @@ def _format_pct(value: float | None, decimals: int = 1) -> str:
     """Format a percentage value for display."""
     if value is None:
         return "N/A"
-    return f"{value * 100:+.{decimals}f}%" if abs(value) < 10 else f"{value * 100:+.{decimals}f}%"
+    return f"{value * 100:+.{decimals}f}%"
 
 
 def _closest_strikes(strikes: list[float], target: float, count: int = _DEFAULT_STRIKE_COUNT) -> list[float]:
@@ -775,17 +775,63 @@ def _analyze_strategy_pl(
             f"butterfly, covered_call, cash_secured_put.",
         }
 
-    # Calculate probability of profit (simplified: use delta approximation)
+    # Calculate probability of profit (delta approximation, strategy-aware)
     pop = None
     if breakevens and leg_greeks:
-        # Approximate POP from delta of the closest ATM leg
-        atm_delta = None
-        for greeks in leg_greeks:
-            if greeks and greeks.get("delta") is not None:
-                atm_delta = abs(greeks["delta"])
-                break
-        if atm_delta is not None:
-            pop = round(max(0.0, min(1.0, 1.0 - atm_delta)) * 100, 1)
+
+        def _has_sell(lside: str) -> bool:
+            return "sell" in lside.lower().strip()
+
+        def _has_buy(lside: str) -> bool:
+            return "buy" in lside.lower().strip()
+
+        def _is_put(ltype: str) -> bool:
+            return "put" in ltype.lower().strip()
+
+        def _is_call(ltype: str) -> bool:
+            return "call" in ltype.lower().strip()
+
+        def _delta(greeks: dict | None) -> float | None:
+            return greeks.get("delta") if greeks else None
+
+        if strategy_type in ("iron_condor",):
+            # PoP = probability price stays between both short strikes
+            # ≈ 1 - P(below short put) - P(above short call)
+            # ≈ 1 - abs(delta_short_put) - delta_short_call
+            sp_delta = None
+            sc_delta = None
+            for i, g in enumerate(leg_greeks):
+                d = _delta(g)
+                if d is None:
+                    continue
+                lt = leg_types[i] if i < len(leg_types) else ""
+                ls = leg_sides[i] if i < len(leg_sides) else ""
+                if sp_delta is None and _is_put(lt) and _has_sell(ls):
+                    sp_delta = abs(d)
+                if sc_delta is None and _is_call(lt) and _has_sell(ls):
+                    sc_delta = d
+            if sp_delta is not None and sc_delta is not None:
+                pop = round(max(0.0, min(1.0, 1.0 - sp_delta - sc_delta)) * 100, 1)
+
+        elif strategy_type in ("vertical_spread", "call_spread", "put_spread",
+                               "covered_call", "cash_secured_put"):
+            # For credit-type strategies: PoP ≈ 1 - abs(short-leg delta)
+            for i, g in enumerate(leg_greeks):
+                d = _delta(g)
+                if d is None:
+                    continue
+                ls = leg_sides[i] if i < len(leg_sides) else ""
+                if _has_sell(ls):
+                    pop = round(max(0.0, min(1.0, 1.0 - abs(d))) * 100, 1)
+                    break
+
+        else:
+            # Fallback for straddle/strangle/butterfly/etc: any-leg delta proxy
+            for g in leg_greeks:
+                d = _delta(g)
+                if d is not None:
+                    pop = round(max(0.0, min(1.0, 1.0 - abs(d))) * 100, 1)
+                    break
 
     # Risk/reward ratio
     risk_reward = None
@@ -841,6 +887,14 @@ def get_options_market_snapshot(
             "symbol": symbol,
             "underlying_price": round(underlying_price, 2),
             "timestamp": datetime.now().isoformat(),
+            "vix": None,
+            "vix_regime": "unavailable",
+            "atm_implied_volatility": None,
+            "iv_assessment": "unavailable",
+            "historical_volatility_20d": None,
+            "iv_hv_ratio": None,
+            "iv_hv_signal": "unavailable",
+            "options_available": False,
         }
 
         # VIX (market fear gauge)

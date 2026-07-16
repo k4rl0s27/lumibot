@@ -45,9 +45,9 @@ require_env TELEGRAM_BOT_TOKEN
 require_env TELEGRAM_CHAT_ID
 
 # At least one LLM provider key must be set
-if [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${GEMINI_API_KEY:-}" ]; then
+if [ -z "${OPENAI_API_KEY:-}" ] && [ -z "${ANTHROPIC_API_KEY:-}" ] && [ -z "${GEMINI_API_KEY:-}" ] && [ -z "${DEEPSEEK_API_KEY:-}" ]; then
     echo "ERROR: At least one LLM provider key must be set."
-    echo "       Set OPENAI_API_KEY, ANTHROPIC_API_KEY, or GEMINI_API_KEY in .env"
+    echo "       Set OPENAI_API_KEY, ANTHROPIC_API_KEY, GEMINI_API_KEY, or DEEPSEEK_API_KEY in .env"
     exit 1
 fi
 
