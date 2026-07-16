@@ -60,14 +60,12 @@ echo ""
 echo "[2/4] Setting defaults..."
 
 export LUMIBOT_MEMORY_DIR="${LUMIBOT_MEMORY_DIR:-/data/memory}"
-export APPROVAL_TIMEOUT_MINUTES="${APPROVAL_TIMEOUT_MINUTES:-30}"
 export TRADING_UNIVERSE="${TRADING_UNIVERSE:-SPY,QQQ,IWM}"
 export LOG_LEVEL="${LOG_LEVEL:-INFO}"
 
 mkdir -p "$LUMIBOT_MEMORY_DIR" /data/logs
 
 echo "       LUMIBOT_MEMORY_DIR=${LUMIBOT_MEMORY_DIR}"
-echo "       APPROVAL_TIMEOUT_MINUTES=${APPROVAL_TIMEOUT_MINUTES}"
 echo "       TRADING_UNIVERSE=${TRADING_UNIVERSE}"
 
 # ------------------------------------------------------------------

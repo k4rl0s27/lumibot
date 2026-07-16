@@ -1,8 +1,8 @@
 """
 Multi-Agent Options Trading Debate Strategy.
 
-A 7-agent LLM system that researches, debates, and decides on options trades
-daily, with human approval via Telegram before any order reaches Tradier (paper).
+A 7-agent LLM system that researches, debates, and executes options trades
+autonomously via Tradier (paper), with Telegram notifications for monitoring.
 
 Agent Team:
   1. macro_analyst      — Market regime, VIX, sector trends → strategy type
@@ -11,11 +11,11 @@ Agent Team:
   4. bull_case           — Strongest thesis for the proposed trade
   5. bear_case           — Risks, edge cases, failure modes
   6. risk_manager        — Portfolio Greeks, sizing, correlation, drawdown
-  7. portfolio_manager   — Weighs all evidence, decides TRADE or PASS
+  7. portfolio_manager   — Weighs all evidence, decides TRADE or PASS, submits orders
 
 Flow:
-  RESEARCH (parallel 1-3) → DEBATE (4-5) → RISK REVIEW (6) → DECISION (7)
-  → Telegram approval gate → Execute on Tradier (paper)
+  RESEARCH (parallel 1-3) → DEBATE (4-5) → RISK REVIEW (6) → DECISION + EXECUTE (7)
+  → Telegram notification
 
 Set TRADIER_ACCESS_TOKEN, TRADIER_ACCOUNT_NUMBER, TRADIER_PAPER=true,
 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, and at least one LLM API key.
@@ -28,16 +28,14 @@ from __future__ import annotations
 
 import logging
 import os
-from datetime import datetime, timedelta
+from datetime import datetime
 
-from lumibot.entities import Order
 from lumibot.strategies.strategy import Strategy
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Agent System Prompts
-# Adapted from TradingAgents patterns; tailored for options trading.
 # ---------------------------------------------------------------------------
 
 MACRO_ANALYST_PROMPT = """You are a Macro Market Analyst specializing in options regime detection. Your role is to evaluate the current market environment and recommend which type of options strategy is most appropriate.
@@ -191,7 +189,9 @@ Do NOT use naked options, straddles, strangles, or uncovered calls/puts.
 Do NOT buy or sell the underlying stock — this strategy trades OPTIONS ONLY.
 If no suitable defined-risk options trade exists, state PASS.
 
-You have access to the built-in order tools (submit_order, etc.). Use them only after human approval is received — the strategy will handle the approval gate."""
+You have access to the built-in order tools (submit_order, etc.) and may
+use them directly to place trades when your decision is TRADE. The orders
+will be sent to the broker immediately — the strategy is fully autonomous."""
 
 
 # ---------------------------------------------------------------------------
@@ -200,11 +200,11 @@ You have access to the built-in order tools (submit_order, etc.). Use them only 
 
 
 class AITradingTeamOptionsDebateStrategy(Strategy):
-    """7-agent options trading strategy with human-in-the-loop approval.
+    """7-agent options trading strategy — fully autonomous.
 
     Runs daily ~1 hour before market close for optimal options liquidity.
-    Agents research, debate, and decide. The final decision is sent to
-    Telegram for human approval before any orders reach Tradier.
+    Agents research, debate, and decide. The PM submits orders directly.
+    Telegram is used for monitoring and status queries only.
     """
 
     parameters = {
@@ -219,10 +219,9 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
     # ==================================================================
 
     def initialize(self):
-        """Set up agents, Telegram bot, and scheduling."""
         self.sleeptime = "1D"
 
-        # ---- Telegram Bot ----
+        # ---- Telegram Bot (monitoring + status queries) ----
         from lumibot.components.notifications import TelegramBot
 
         self.telegram_bot = TelegramBot(
@@ -232,7 +231,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
         )
         self.telegram_bot.start()
 
-        # Also configure outbound notifications
+        # Outbound notifications (via existing notification system)
         self.notifications.configure_telegram(
             bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
             chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
@@ -243,8 +242,6 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
         decision_model = os.environ.get("PORTFOLIO_MANAGER_MODEL", "deepseek/deepseek-reasoner")
 
         # ---- Options Agent Tools ----
-        # These @agent_tool functions give agents access to live options chains,
-        # Greeks, IV/HV analysis, strategy P/L, and portfolio risk metrics.
         from lumibot.components.agents.options_tools import (
             get_option_chain_summary,
             get_option_strategy_analysis,
@@ -261,7 +258,6 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
 
         # ---- Create Agents (1-6: read-only, 7: trading) ----
 
-        # 1. Macro Analyst
         self.agents.create(
             name="macro_analyst",
             model=research_model,
@@ -270,7 +266,6 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             tools=_options_tools,
         )
 
-        # 2. Technical Analyst
         self.agents.create(
             name="technical_analyst",
             model=research_model,
@@ -279,7 +274,6 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             tools=_options_tools,
         )
 
-        # 3. Options Analyst
         self.agents.create(
             name="options_analyst",
             model=research_model,
@@ -288,7 +282,6 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             tools=_options_tools,
         )
 
-        # 4. Bull Case
         self.agents.create(
             name="bull_case",
             model=research_model,
@@ -297,7 +290,6 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             tools=_options_tools,
         )
 
-        # 5. Bear Case
         self.agents.create(
             name="bear_case",
             model=research_model,
@@ -306,7 +298,6 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             tools=_options_tools,
         )
 
-        # 6. Risk Manager
         self.agents.create(
             name="risk_manager",
             model=research_model,
@@ -315,7 +306,6 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             tools=_options_tools,
         )
 
-        # 7. Portfolio Manager (trade-enabled)
         self.agents.create(
             name="portfolio_manager",
             model=decision_model,
@@ -327,30 +317,22 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
         self.log_message("Options Debate Strategy initialized with 7 agents.", color="green")
 
     # ==================================================================
-    # Lifecycle: Before Trading (trigger daily before market close)
+    # Lifecycle: Before Trading
     # ==================================================================
 
     def before_market_closes(self):
-        """Ensure we run ~1 hour before close for best options liquidity."""
-        # LumiBot's sleeptime="1D" handles daily cycles.
-        # The exact timing depends on the broker/market calendar.
-        # This hook can adjust scheduling if needed.
         pass
 
     # ==================================================================
-    # Lifecycle: On Trading Iteration (the main daily flow)
+    # Lifecycle: On Trading Iteration
     # ==================================================================
 
     def on_trading_iteration(self):
-        """Execute the full agent debate → decision → approval → execution flow."""
         universe = self.parameters["universe"]
         today = self.get_datetime().date().isoformat()
 
         self.log_message(f"=== Options Debate Cycle: {today} ===", color="yellow")
         self.log_message(f"Universe: {', '.join(universe)}", color="yellow")
-
-        # ---- Phase 1: RESEARCH (agents 1-3, run sequentially since each
-        #      agent's output depends on understanding the full picture) ----
 
         context_base = {
             "date": today,
@@ -360,10 +342,11 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             "max_loss_per_trade_pct": self.parameters["max_loss_per_trade_pct"],
         }
 
-        self.log_message("[1/5] Running research analysts...", color="blue")
+        # ---- Phase 1: RESEARCH ----
 
-        # 1a. Macro Analyst
-        self.log_message("  → Macro Analyst researching market regime...", color="blue")
+        self.log_message("[1/4] Running research analysts...", color="blue")
+
+        self.log_message("  -> Macro Analyst researching market regime...", color="blue")
         macro_result = self.agents["macro_analyst"].run(
             task_prompt=(
                 f"Analyze the current market regime for options trading. "
@@ -376,10 +359,9 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             ),
             context=context_base,
         )
-        self.log_message(f"  ← Macro Analyst done.", color="blue")
+        self.log_message("  <- Macro Analyst done.", color="blue")
 
-        # 1b. Technical Analyst
-        self.log_message("  → Technical Analyst reviewing price action...", color="blue")
+        self.log_message("  -> Technical Analyst reviewing price action...", color="blue")
         technical_result = self.agents["technical_analyst"].run(
             task_prompt=(
                 f"Analyze the technical setup for each symbol in the universe: "
@@ -390,10 +372,9 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             ),
             context=context_base,
         )
-        self.log_message(f"  ← Technical Analyst done.", color="blue")
+        self.log_message("  <- Technical Analyst done.", color="blue")
 
-        # 1c. Options Analyst
-        self.log_message("  → Options Analyst querying chains and Greeks...", color="blue")
+        self.log_message("  -> Options Analyst querying chains and Greeks...", color="blue")
         options_result = self.agents["options_analyst"].run(
             task_prompt=(
                 f"Query options chains for the symbols in the universe: "
@@ -407,11 +388,11 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             ),
             context=context_base,
         )
-        self.log_message(f"  ← Options Analyst done.", color="blue")
+        self.log_message("  <- Options Analyst done.", color="blue")
 
-        # ---- Phase 2: DEBATE (agents 4-5) ----
+        # ---- Phase 2: DEBATE ----
 
-        self.log_message("[2/5] Running bull/bear debate...", color="blue")
+        self.log_message("[2/4] Running bull/bear debate...", color="blue")
 
         research_context = {
             **context_base,
@@ -420,8 +401,7 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             "options_analysis": options_result.summary or options_result.text,
         }
 
-        # 2a. Bull Case
-        self.log_message("  → Bull Case building thesis...", color="blue")
+        self.log_message("  -> Bull Case building thesis...", color="blue")
         bull_result = self.agents["bull_case"].run(
             task_prompt=(
                 f"Build the strongest possible bull case for the best options trade "
@@ -432,10 +412,9 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             ),
             context=research_context,
         )
-        self.log_message(f"  ← Bull Case done.", color="blue")
+        self.log_message("  <- Bull Case done.", color="blue")
 
-        # 2b. Bear Case
-        self.log_message("  → Bear Case stress-testing...", color="blue")
+        self.log_message("  -> Bear Case stress-testing...", color="blue")
         bear_result = self.agents["bear_case"].run(
             task_prompt=(
                 f"Stress-test the options trade proposed by the research team. "
@@ -451,11 +430,11 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
                 "bull_case": bull_result.summary or bull_result.text,
             },
         )
-        self.log_message(f"  ← Bear Case done.", color="blue")
+        self.log_message("  <- Bear Case done.", color="blue")
 
-        # ---- Phase 3: RISK REVIEW (agent 6) ----
+        # ---- Phase 3: RISK REVIEW ----
 
-        self.log_message("[3/5] Running risk assessment...", color="blue")
+        self.log_message("[3/4] Running risk assessment...", color="blue")
         risk_result = self.agents["risk_manager"].run(
             task_prompt=(
                 f"Assess portfolio-level risk for the proposed options trade. "
@@ -473,26 +452,19 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
                 "bear_case": bear_result.summary or bear_result.text,
             },
         )
-        self.log_message(f"  ← Risk Manager done (recommendation: APPROVE/REDUCE/REJECT).", color="blue")
+        self.log_message("  <- Risk Manager done.", color="blue")
 
-        # ---- Phase 4: DECISION (agent 7) ----
-        # Snapshot open orders BEFORE the PM agent runs, so we can identify
-        # which orders it submitted (if any) for potential cancellation.
+        # ---- Phase 4: DECISION + EXECUTE ----
 
-        self.log_message("[4/5] Portfolio Manager making final decision...", color="blue")
-        pre_pm_order_ids = {
-            o.identifier
-            for o in self.get_orders(statuses=Order.ACTIVE_STATUSES)
-            if getattr(o, "identifier", None)
-        }
-
+        self.log_message("[4/4] Portfolio Manager making final decision...", color="blue")
         pm_result = self.agents["portfolio_manager"].run(
             task_prompt=(
                 f"Synthesize ALL research, debate, and risk analysis into a final "
                 f"decision: TRADE or PASS.\n\n"
                 f"If TRADE: Be specific about exact strikes, expirations, quantities, "
                 f"and limit prices for each leg. Use defined-risk strategies. "
-                f"Max loss {self.parameters['max_loss_per_trade_pct']}% of portfolio.\n\n"
+                f"Max loss {self.parameters['max_loss_per_trade_pct']}% of portfolio. "
+                f"Submit orders directly using submit_order.\n\n"
                 f"If PASS: Explain why and what would change your mind.\n\n"
                 f"Universe: {', '.join(universe)}. Today: {today}."
             ),
@@ -504,30 +476,29 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             },
         )
         decision_text = pm_result.summary or pm_result.text
-        self.log_message(f"  ← Portfolio Manager decision:\n{decision_text}", color="green")
+        self.log_message(f"  <- Portfolio Manager decision:\n{decision_text}", color="green")
 
-        # Identify orders the PM agent submitted during its run
-        pm_submitted_orders = [
-            o
-            for o in self.get_orders(statuses=Order.ACTIVE_STATUSES)
-            if getattr(o, "identifier", None) and o.identifier not in pre_pm_order_ids
-        ]
-        if pm_submitted_orders:
-            self.log_message(
-                f"  PM agent submitted {len(pm_submitted_orders)} order(s): "
-                f"{[o.identifier for o in pm_submitted_orders]}",
-                color="blue",
+        # Notify via Telegram + outbound notification
+        is_trade = "FINAL DECISION: TRADE" in decision_text
+
+        if is_trade:
+            self.telegram_bot.send_message(
+                f"<b>\U0001f4c8 Trade Executed</b>\n\n{decision_text[:1500]}"
             )
-
-        # ---- Phase 5: HUMAN APPROVAL GATE ----
-        # Gate on ORDERS SUBMITTED, not on decision text.
-        # The PM may call its decision TRADE, PIVOT, ADAPT, or anything else —
-        # if it submitted real orders, the human MUST approve or reject them.
-        # If no orders were submitted, it's a true PASS with nothing to gate.
-
-        if not pm_submitted_orders:
-            # True PASS — PM didn't submit any orders. Nothing to approve.
-            self.log_message("[5/5] Decision: PASS. No orders submitted.", color="yellow")
+            self.notify(
+                title="Options Debate — TRADE",
+                message=decision_text[:800],
+                severity="info",
+            )
+            self.memory.remember_decision(
+                f"EXECUTED: {decision_text[:300]}",
+                symbol=",".join(universe),
+                action="buy",
+            )
+        else:
+            self.telegram_bot.send_message(
+                f"<b>\U0001f4ed PASS — No Trade Today</b>\n\n{decision_text[:1000]}"
+            )
             self.notify(
                 title="Options Debate — PASS",
                 message=f"No trade today.\n\n{decision_text[:500]}",
@@ -535,93 +506,6 @@ class AITradingTeamOptionsDebateStrategy(Strategy):
             )
             self.memory.remember_decision(
                 f"PASS: {decision_text[:300]}",
-                symbol=",".join(universe),
-                action="hold",
-            )
-            self.log_message(f"=== Options Debate Cycle Complete: {today} ===", color="yellow")
-            return
-
-        # Orders were submitted — check if we need human approval
-        skip_approval = os.environ.get("SKIP_HUMAN_APPROVAL", "false").lower() in ("true", "1", "yes")
-
-        if skip_approval:
-            # Auto-approve: orders go straight to broker, no human gate.
-            self.log_message(
-                f"[5/5] SKIP_HUMAN_APPROVAL=true — {len(pm_submitted_orders)} order(s) "
-                f"auto-approved. Verify in Tradier dashboard.",
-                color="green",
-            )
-            self.notify(
-                title="🤖 Trade Auto-Approved",
-                message=f"{len(pm_submitted_orders)} order(s) submitted to Tradier paper.\n\n"
-                f"{decision_text[:800]}",
-                severity="info",
-            )
-            self.memory.remember_decision(
-                f"AUTO-APPROVED: {decision_text[:300]}",
-                symbol=",".join(universe),
-                action="buy",
-            )
-            self.log_message(f"=== Options Debate Cycle Complete: {today} ===", color="yellow")
-            return
-
-        # Human approval required
-        self.log_message(
-            f"[5/5] {len(pm_submitted_orders)} order(s) submitted — sending to Telegram for approval...",
-            color="yellow",
-        )
-
-        self.telegram_bot.send_approval_request(decision_text)
-
-        self.notify(
-            title="⚡ Options Trade — Approval Required",
-            message=f"A trade decision is waiting for your approval.\n\n"
-            f"Use /decision to view details, then /approve or /reject.",
-            severity="warning",
-        )
-
-        # Block waiting for human response
-        timeout = int(os.environ.get("APPROVAL_TIMEOUT_MINUTES", "30"))
-        self.log_message(f"Waiting for Telegram approval (timeout: {timeout} min)...", color="yellow")
-        approved = self.telegram_bot.wait_for_approval(timeout_minutes=timeout)
-
-        if approved:
-            self.log_message("✅ Trade APPROVED by user. Orders stay at broker.", color="green")
-            self.notify(
-                title="✅ Trade Approved",
-                message=f"Executing the approved trade now.\n\n{decision_text[:500]}",
-                severity="info",
-            )
-            self.memory.remember_decision(
-                f"APPROVED: {decision_text[:300]}",
-                symbol=",".join(universe),
-                action="buy",
-            )
-        else:
-            # Cancel any orders the PM agent submitted before approval was denied
-            self.log_message(
-                f"Cancelling {len(pm_submitted_orders)} order(s) submitted before approval...",
-                color="yellow",
-            )
-            try:
-                self.cancel_orders(pm_submitted_orders)
-                self.log_message("Orders cancelled successfully.", color="green")
-            except Exception as cancel_err:
-                self.log_message(
-                    f"WARNING: Failed to cancel some orders: {cancel_err}. "
-                    f"Please manually cancel in Tradier dashboard.",
-                    color="red",
-                )
-
-            self.log_message("❌ Trade REJECTED or timed out. Orders cancelled.", color="red")
-            self.notify(
-                title="❌ Trade Rejected",
-                message=f"The trade was rejected (or approval timed out). "
-                f"Orders have been cancelled.\n\n{decision_text[:300]}",
-                severity="warning",
-            )
-            self.memory.remember_decision(
-                f"REJECTED: {decision_text[:300]}",
                 symbol=",".join(universe),
                 action="hold",
             )
@@ -649,7 +533,6 @@ if __name__ == "__main__":
             },
         )
     else:
-        # Live/Paper trading with Tradier
         from lumibot.brokers import Tradier
         from lumibot.traders import Trader
 

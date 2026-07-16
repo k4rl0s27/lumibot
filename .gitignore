@@ -93,3 +93,6 @@ context*.json
 
 # Local scratch / diagnostics (never commit)
 tmp/
+
+# Runtime agent memory data (never commit)
+data/memory/
