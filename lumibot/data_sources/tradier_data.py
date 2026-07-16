@@ -398,8 +398,6 @@ class TradierData(DataSource):
                     asset.right,
                     asset.strike,
                 )
-            elif asset.asset_type == "index":
-                symbol = f"I:{asset.symbol}"
             else:
                 symbol = asset.symbol
 
